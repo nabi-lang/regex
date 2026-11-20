@@ -1,0 +1,81 @@
+// Unicode classes by general category, script and property, against
+// characters whose UCD 18.0.0 values are known.
+
+use pkg::tests::suite::{all, find};
+
+#[test]
+fn general_categories() {
+    assert(find(r"\pL+", "12abcé3") == "abcé");
+    assert(find(r"\p{L}+", "12abcé3") == "abcé");
+    assert(find(r"\p{Letter}+", "12abcé3") == "abcé");
+    assert(find(r"\p{Lu}+", "abCDé") == "CD");
+    assert(find(r"\p{Uppercase_Letter}+", "abCDé") == "CD");
+    assert(find(r"\p{uppercase letter}+", "abCDé") == "CD");
+    assert(find(r"\p{Ll}+", "ABcdÉ") == "cd");
+    assert(find(r"\p{gc=Nd}+", "x٣٤5y") == "٣٤5");
+    assert(find(r"\p{General_Category=Decimal_Number}+", "x٣٤5y") == "٣٤5");
+    assert(find(r"\pN+", "x½Ⅻ3y") == "½Ⅻ3");
+    assert(find(r"\p{Sc}", "price: €5") == "€");
+    assert(find(r"\p{Zs}", "a\u{00A0}b") == "\u{00A0}");
+    assert(find(r"\p{P}+", "ab!¿c") == "!¿");
+    assert(find(r"\p{S}+", "a+€b") == "+€");
+    assert(find(r"\p{M}", "e\u{0301}") == "\u{0301}");
+    assert(find(r"\p{Cc}", "a\x07") == "\x07");
+    assert(find(r"\p{Co}", "a\u{E000}") == "\u{E000}");
+    assert(find(r"\p{Cn}", "a\u{0378}") == "\u{0378}");
+    assert(find(r"\p{LC}+", "ǅaB1") == "ǅaB");
+    assert(find(r"\P{L}+", "ab12cd") == "12");
+    assert(find(r"\PL+", "ab12cd") == "12");
+    assert(find(r"\p{^L}+", "ab12cd") == "12");
+    assert(find(r"\P{^L}+", "12ab") == "ab");
+    assert(find(r"\p{Any}+", "a😀\n") == "a😀\n");
+    assert(find(r"\p{ASCII}+", "éabc") == "abc");
+    assert(find(r"\p{Assigned}", "\u{0378}a") == "a");
+}
+
+#[test]
+fn scripts() {
+    assert(find(r"\p{Greek}+", "abc αβγ def") == "αβγ");
+    assert(find(r"\p{Grek}+", "abc αβγ def") == "αβγ");
+    assert(find(r"\p{sc=Greek}+", "abc αβγ def") == "αβγ");
+    assert(find(r"\p{Script=Grek}+", "abc αβγ def") == "αβγ");
+    assert(find(r"\p{IsGreek}+", "abc αβγ def") == "αβγ");
+    assert(find(r"\p{Hangul}+", "한글 text") == "한글");
+    assert(find(r"\p{Han}+", "漢字かな") == "漢字");
+    assert(find(r"\p{Hiragana}+", "漢字かな") == "かな");
+    assert(find(r"\p{Cyrillic}+", "Привет, world") == "Привет");
+    assert(find(r"\p{Latin}+", "Привет, world") == "world");
+    assert(find(r"\p{Arabic}+", "abc مرحبا") == "مرحبا");
+    assert(find(r"\p{Common}+", "abc 123 def") == " 123 ");
+    assert(find(r"\p{Zyyy}+", "abc 123 def") == " 123 ");
+    assert(find(r"\P{Latin}+", "abc 123 def") == " 123 ");
+    assert(find(r"[\p{Greek}\p{Cyrillic}]+", "aαжb") == "αж");
+    assert(find(r"[\p{L}--\p{Latin}]+", "abαβ") == "αβ");
+}
+
+#[test]
+fn properties() {
+    assert(find(r"\p{Alphabetic}+", "1ab٣") == "ab");
+    assert(find(r"\p{White_Space}+", "a\u{2028}\u{3000}b") == "\u{2028}\u{3000}");
+    assert(find(r"\p{Lowercase}+", "ABcdª") == "cdª");
+    assert(find(r"\p{Uppercase}+", "abCDⅫ") == "CDⅫ");
+    // `\w` includes marks, connector punctuation and joiners (UTS #18)
+    assert(find(r"\w+", "e\u{0301}‿x\u{200D}") == "e\u{0301}‿x\u{200D}");
+}
+
+#[test]
+fn version() {
+    assert(pkg::UNICODE_VERSION == "18.0.0");
+}
+
+#[test]
+fn offsets_are_char_boundaries() {
+    // every span starts and ends on a char boundary
+    let h = "aé😀b€";
+    for m in pkg::tests::suite::re(r"\p{Any}").find_iter(h) {
+        assert(h[m.start():m.end()] == m.as_str());
+    }
+    assert(all(r"", "é😀") == ["", "", ""]);
+    assert(pkg::tests::suite::spans(r"", "é😀") == [(0, 0), (2, 2), (6, 6)]);
+    assert(pkg::tests::suite::spans(r"x*", "éx") == [(0, 0), (2, 3)]);
+}

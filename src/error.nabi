@@ -1,0 +1,53 @@
+// The one error type of the package. Each message says what went wrong
+// and what to write instead.
+
+/// What went wrong building a regex.
+///
+/// ```nabi
+/// use regex::{Regex, RegexError};
+///
+/// let e = try {
+///     _ = try Regex::new("(ab");
+///     ""
+/// } catch e: RegexError { f"{e}" };
+/// assert(e.contains("unclosed group"));
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub enum RegexError {
+    /// The pattern does not parse. `at` is the byte offset in `pattern`
+    /// where the problem starts.
+    Syntax { pattern: str; at: usize; message: str; },
+    /// The compiled program would exceed the size limit.
+    TooBig { limit: usize; },
+}
+
+impl RegexError {
+    /// The byte offset of a syntax error in the pattern, `none` for a
+    /// size error.
+    ///
+    /// ```nabi
+    /// let e = try { _ = try regex::Regex::new("a)"); 0 } catch e: regex::RegexError { e.position() ?? 99 };
+    /// assert(e == 1);
+    /// ```
+    pub const fn position(self) -> usize | none {
+        match self {
+            RegexError::Syntax { at, .. } => at,
+            RegexError::TooBig { .. } => none,
+        }
+    }
+}
+
+impl Display for RegexError {
+    const fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            RegexError::Syntax { pattern, at, message } => {
+                let col = pattern[:at].char_count();
+                f"regex parse error at byte {at}: {message}\n    {pattern}\n    {" ".repeat(col)}^"
+            }
+            RegexError::TooBig { limit } => f"compiled regex exceeds the size limit of {limit} bytes; use a smaller pattern (fewer or shorter counted repetitions like `{{1000}}`, smaller Unicode classes) or raise it with `RegexBuilder::size_limit`",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Error for RegexError {}

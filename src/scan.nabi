@@ -1,0 +1,179 @@
+// Byte searches over a haystack: one to three bytes, a byte set, and a
+// substring. The loops are plain so the compiler vectorizes them.
+// Each looks at the bytes `at..end` of `h` and gives an offset or -1.
+
+/// The first `c` in `b[at..end]`.
+pub(pkg) fn memchr(h: str, at: usize, end: usize, c: u8) -> i64 {
+    if at >= end { return -1i64; }
+    // a loop over a whole slice from 0 is the form the compiler vectorizes
+    let s = h.as_bytes()[at:end];
+    let n = s.len();
+    let i = 0usize;
+    while i < n {
+        if s[i] == c { return (at + i) as i64; }
+        i += 1;
+    }
+    -1i64
+}
+
+/// The first `c0` or `c1`.
+pub(pkg) fn memchr2(h: str, at: usize, end: usize, c0: u8, c1: u8) -> i64 {
+    if at >= end { return -1i64; }
+    let s = h.as_bytes()[at:end];
+    let n = s.len();
+    let i = 0usize;
+    while i < n {
+        let x = s[i];
+        if x == c0 || x == c1 { return (at + i) as i64; }
+        i += 1;
+    }
+    -1i64
+}
+
+/// The first `c0`, `c1` or `c2`.
+pub(pkg) fn memchr3(h: str, at: usize, end: usize, c0: u8, c1: u8, c2: u8) -> i64 {
+    if at >= end { return -1i64; }
+    let s = h.as_bytes()[at:end];
+    let n = s.len();
+    let i = 0usize;
+    while i < n {
+        let x = s[i];
+        if x == c0 || x == c1 || x == c2 { return (at + i) as i64; }
+        i += 1;
+    }
+    -1i64
+}
+
+/// The first byte in `set` (256 flags).
+pub(pkg) fn memset(h: str, at: usize, end: usize, set: List<bool>) -> i64 {
+    let b = h.as_bytes();
+    let i = at;
+    while i < end {
+        if set[b[i] as usize] { return i as i64; }
+        i += 1;
+    }
+    -1i64
+}
+
+/// How common byte `b` is in typical text and logs, low for rare:
+/// spaces and lowercase letters, then punctuation of code and logs,
+/// then capitals and digits, then other punctuation, then control
+/// bytes. In UTF-8 text a lead byte repeats more than each continuation
+/// byte does.
+pub(pkg) fn rank(b: u8) -> i32 {
+    let lower = " etaoinsrhldcumfpgwybvkxjqz";
+    for i in 0..lower.len() {
+        if lower.byte(i) == b { return 255 - i as i32; }
+    }
+    let x = b as i32;
+    if x >= 0x41 && x <= 0x5A {
+        for i in 1..lower.len() {
+            if lower.byte(i) == b + 0x20u8 { return 176 - i as i32; }
+        }
+    }
+    if x == 0x0A || x == 0x2C || x == 0x2E { return 220; }
+    if ".,:;-_=/[]()\"'".contains(f"{b as char}") { return 180; }
+    if x >= 0x30 && x <= 0x39 { return 170; }
+    if x >= 0xC2 && x < 0xF5 { return 165; }
+    if x >= 0x80 && x < 0xC0 { return 140; }
+    if x >= 0x21 && x < 0x7F { return 100; }
+    if x == 0x09 || x == 0x0D { return 90; }
+    10
+}
+
+/// The first `p` in `at..at + n` with byte `c0` at `p + r0` and `c1`
+/// at `p + r1`; the bytes from `at` to `at + n` plus both offsets must
+/// be in `h`. One vectorized pass, no early exit per byte (`&`, not
+/// `&&`).
+pub(pkg) fn pair(h: str, at: usize, n: usize, r0: usize, c0: u8, r1: usize, c1: u8) -> i64 {
+    if n == 0 { return -1i64; }
+    let b = h.as_bytes();
+    let s0 = b[at + r0:at + r0 + n];
+    let s1 = b[at + r1:at + r1 + n];
+    // the bound is a slice's own length: the form the compiler vectorizes
+    let k = s0.len();
+    let i = 0usize;
+    while i < k {
+        if (s0[i] == c0) & (s1[i] == c1) { return (at + i) as i64; }
+        i += 1;
+    }
+    -1i64
+}
+
+/// `pair` with a set of up to three bytes at each offset, packed a byte
+/// each (repeat a byte to fill).
+pub(pkg) fn pair3(h: str, at: usize, n: usize, r0: usize, a: u32, r1: usize, c: u32) -> i64 {
+    if n == 0 { return -1i64; }
+    let b = h.as_bytes();
+    let s0 = b[at + r0:at + r0 + n];
+    let s1 = b[at + r1:at + r1 + n];
+    let a0 = a as u8;
+    let a1 = (a >> 8u32) as u8;
+    let a2 = (a >> 16u32) as u8;
+    let c0 = c as u8;
+    let c1 = (c >> 8u32) as u8;
+    let c2 = (c >> 16u32) as u8;
+    let k = s0.len();
+    let i = 0usize;
+    while i < k {
+        let u = s0[i];
+        let v = s1[i];
+        if (((u == a0) | (u == a1)) | (u == a2)) & (((v == c0) | (v == c1)) | (v == c2)) { return (at + i) as i64; }
+        i += 1;
+    }
+    -1i64
+}
+
+/// A substring search: candidates have the needle's two rarest bytes at
+/// their offsets, then the whole needle is compared.
+pub(pkg) struct Finder {
+    pub(pkg) lit: str;
+    /// Offsets of the rarest and the second rarest byte, `r0 | r1 << 32`.
+    rare: u64;
+}
+
+pub(pkg) fn finder(lit: str) -> Finder {
+    let r0 = 0usize;
+    let r1 = 0usize;
+    for i in 0..lit.len() {
+        if rank(lit.byte(i)) < rank(lit.byte(r0)) { r0 = i; }
+    }
+    let best = 1000;
+    for i in 0..lit.len() {
+        if i != r0 && rank(lit.byte(i)) < best {
+            best = rank(lit.byte(i));
+            r1 = i;
+        }
+    }
+    Finder { lit: lit, rare: (r0 as u64) | ((r1 as u64) << 32u64) }
+}
+
+impl Finder {
+    /// The first occurrence starting in `at..` and ending by `end`.
+    pub(pkg) fn find(self, h: str, at: usize, end: usize) -> i64 {
+        let lit = self.lit;
+        let m = lit.len();
+        if m == 0 { return if at <= end { at as i64 } else { -1i64 }; }
+        if at + m > end { return -1i64; }
+        let l = lit.as_bytes();
+        if m == 1 { return memchr(h, at, end, l[0]); }
+        let b = h.as_bytes();
+        let r0 = (self.rare & 0xFFFFFFFFu64) as usize;
+        let r1 = (self.rare >> 32u64) as usize;
+        let c0 = l[r0];
+        let c1 = l[r1];
+        let i = at;
+        // candidates start in `i..=end - m`
+        let last = end - m;
+        loop {
+            let k = pair(h, i, last + 1 - i, r0, c0, r1, c1);
+            if k < 0i64 { return -1i64; }
+            let p = k as usize;
+            let j = 0usize;
+            while j < m && b[p + j] == l[j] { j += 1; }
+            if j == m { return k; }
+            i = p + 1;
+            if i > last { return -1i64; }
+        }
+    }
+}

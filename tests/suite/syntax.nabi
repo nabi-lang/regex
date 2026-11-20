@@ -1,0 +1,143 @@
+// Literals, `.`, alternation, repetition, anchors, flags and escapes.
+
+use pkg::tests::suite::{all, find, re, some, span};
+
+#[test]
+fn literals() {
+    assert(find("abc", "xxabcxx") == "abc");
+    assert(span("abc", "xxabcxx") == (2, 5));
+    assert(find("abc", "ab") == none);
+    assert(find("", "abc") == "");
+    assert(span("", "abc") == (0, 0));
+    assert(find("é", "café") == "é");
+    assert(span("世界", "hello 世界") == (6, 12));
+}
+
+#[test]
+fn dot() {
+    assert(find("a.c", "abc") == "abc");
+    assert(find("a.c", "a\nc") == none);
+    assert(find("(?s)a.c", "a\nc") == "a\nc");
+    assert(find("a.c", "a€c") == "a€c");
+    assert(find("^.$", "😀") == "😀");
+    assert(find("^..$", "😀") == none);
+}
+
+#[test]
+fn alternation() {
+    assert(find("cat|dog", "hotdog") == "dog");
+    assert(find("a|ab", "ab") == "a");
+    assert(find("ab|a", "ab") == "ab");
+    assert(find("a|", "b") == "");
+    assert(find("|a", "a") == "");
+    assert(find("(?:x|y|z)+", "--zyxq") == "zyx");
+}
+
+#[test]
+fn repetition() {
+    assert(find("a*", "aaa") == "aaa");
+    assert(find("a+", "baaa") == "aaa");
+    assert(find("a?b", "ab") == "ab");
+    assert(find("a{2}", "aaaa") == "aa");
+    assert(find("a{2,}", "aaaa") == "aaaa");
+    assert(find("a{2,3}", "aaaa") == "aaa");
+    assert(find("a{0}", "aaa") == "");
+    assert(find("a{0,1}b", "aab") == "ab");
+    assert(find("(?:ab){3}", "abababab") == "ababab");
+    assert(find("x{1,3}?", "xxx") == "x");
+    assert(find("x{2,}?", "xxxx") == "xx");
+    assert(find("(?x)x{ 2 }", "xx") == "xx");
+}
+
+#[test]
+fn lazy() {
+    assert(find("a+?", "aaa") == "a");
+    assert(find("a*?", "aaa") == "");
+    assert(find("a??b", "ab") == "ab");
+    assert(find("<.+?>", "<a><b>") == "<a>");
+    assert(find("<.+>", "<a><b>") == "<a><b>");
+    assert(find("(?U)<.+>", "<a><b>") == "<a>");
+    assert(find("(?U)<.+?>", "<a><b>") == "<a><b>");
+}
+
+#[test]
+fn anchors() {
+    assert(find("^abc", "abc") == "abc");
+    assert(find("^abc", "xabc") == none);
+    assert(find("abc$", "xabc") == "abc");
+    assert(find("abc$", "abc\n") == none);
+    assert(find("(?m)^b", "a\nb") == "b");
+    assert(find("(?m)a$", "a\nb") == "a");
+    assert(find(r"\Aa", "ba") == none);
+    assert(find(r"a\z", "ba") == "a");
+    assert(find(r"(?m)\Ab", "a\nb") == none);
+    assert(all("(?m)^", "a\nb\n") == ["", "", ""]);
+    assert(all("(?m)$", "a\nb") == ["", ""]);
+    assert(find("^$", "") == "");
+    assert(find("$^", "") == "");
+}
+
+#[test]
+fn word_boundaries() {
+    assert(all(r"\bfoo\b", "foo food foo.") == ["foo", "foo"]);
+    assert(span(r"\Boo\B", "foo food") == (5, 7));
+    assert(span(r"\Bo", "foo") == (1, 2));
+    assert(all(r"\b", "ab cd") == ["", "", "", ""]);
+    assert(all(r"\<\w+", "ab cd") == ["ab", "cd"]);
+    assert(all(r"\w+\>", "ab cd") == ["ab", "cd"]);
+    assert(all(r"\b{start}\w", "ab cd") == ["a", "c"]);
+    assert(all(r"\w\b{end}", "ab cd") == ["b", "d"]);
+    // Unicode word characters by default
+    assert(find(r"\bété\b", "un été chaud") == "été");
+    assert(find(r"\b\w+\b", "Σίσυφος!") == "Σίσυφος");
+    assert(find(r"(?-u)\b\w+\b", "Σίσυφος a1") == "a1");
+    assert(find(r"\bx", "éx") == none);
+    assert(find(r"(?-u)\bx", "éx") == "x");
+}
+
+#[test]
+fn flags() {
+    assert(find("(?i)abc", "xABCx") == "ABC");
+    assert(find("a(?i)b", "aB") == "aB");
+    assert(find("a(?i)b", "AB") == none);
+    assert(find("(?i:a)b", "Ab") == "Ab");
+    assert(find("(?i:a)b", "AB") == none);
+    assert(find("(?i)a(?-i)b", "Ab") == "Ab");
+    assert(find("(?i)a(?-i)b", "AB") == none);
+    assert(find("(?i)a|b", "B") == "B");
+    assert(find("(?ms)^a.b$", "x\na\nb\ny") == "a\nb");
+    assert(find("(?x) a b c # comment", "abc") == "abc");
+    assert(find("(?x) a \\  b", "a b") == "a b");
+    assert(find("(?x) [ a b ]+", "abba") == "abba");
+    assert(find("(?x)a\\#b", "a#b") == "a#b");
+    // a flag group inside a group ends with it
+    assert(find("(?:(?i)a)a", "Aa") == "Aa");
+    assert(find("(?:(?i)a)a", "AA") == none);
+}
+
+#[test]
+fn escapes() {
+    assert(find(r"\x41\x{42}C\U00000044", "ABCD") == "ABCD");
+    assert(find(r"\x{1F600}", "a😀") == "😀");
+    assert(find(r"\t\n\r\f\v\a", "\t\n\r\x0C\x0B\x07") == "\t\n\r\x0C\x0B\x07");
+    assert(find(r"\.\*\+\?\(\)\[\]\{\}\|\^\$\\", ".*+?()[]{}|^$\\") == ".*+?()[]{}|^$\\");
+    assert(find(r"\-\&\~\#\ ", "-&~# ") == "-&~# ");
+}
+
+#[test]
+fn escape_function() {
+    let s = "a.b*c+(d)[e]{f}|g^h$i\\j#k&l-m~n?";
+    let r = re(pkg::escape(s));
+    assert(some(r.find(f"xx{s}yy")).as_str() == s);
+    assert(pkg::escape("plain") == "plain");
+    assert(pkg::escape("") == "");
+    assert(pkg::escape("é.") == "é\\.");
+}
+
+#[test]
+fn as_str_and_display() {
+    let r = re("a+b");
+    assert(r.as_str() == "a+b");
+    assert(f"{r}" == "a+b");
+    assert(f"{r:?}" == "Regex(\"a+b\")");
+}

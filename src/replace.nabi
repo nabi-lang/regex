@@ -1,0 +1,101 @@
+// Replacing matches: a template with `$` groups, a literal, or a
+// function of the groups.
+
+use pkg::{Captures, Regex};
+
+/// What `Regex::replace` puts in place of each match. `str` is a
+/// template (`$1`, `${name}`, `$$`; see `Captures::expand`),
+/// `NoExpand` a literal, and a `fn(Captures) -> str` computes it.
+///
+/// ```nabi
+/// use regex::{Captures, Regex};
+///
+/// let re = try Regex::new(r"\d+");
+/// let doubled = re.replace_all("3 apples, 12 pears", |c: Captures| f"{(try! c[0].parse::<i64>()) * 2}");
+/// assert(doubled == "6 apples, 24 pears");
+/// ```
+pub trait Replacer {
+    /// Appends the replacement for the match `caps` to `dst`.
+    fn append(self, caps: Captures, dst: StrBuf);
+
+    /// The replacement when it is the same for every match, so the
+    /// groups need not be found.
+    fn fixed(self) -> str | none { none }
+}
+
+impl Replacer for str {
+    fn append(self, caps: Captures, dst: StrBuf) { caps.expand_into(self, dst); }
+
+    fn fixed(self) -> str | none { if self.contains("$") { none } else { self } }
+}
+
+/// A replacement used as is: `$` has no meaning in it.
+///
+/// ```nabi
+/// use regex::{NoExpand, Regex};
+///
+/// let re = try Regex::new("x");
+/// assert(re.replace_all("axb", NoExpand("$1")) == "a$1b");
+/// ```
+pub struct NoExpand(pub str);
+
+impl Replacer for NoExpand {
+    fn append(self, caps: Captures, dst: StrBuf) {
+        _ = caps;
+        dst.push_str(self.0);
+    }
+
+    fn fixed(self) -> str | none { self.0 }
+}
+
+impl Replacer for fn(Captures) -> str {
+    fn append(self, caps: Captures, dst: StrBuf) { dst.push_str(self(caps)); }
+}
+
+impl Regex {
+    /// `h` with the first match replaced by `rep`.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"(\w+)@(\w+)");
+    /// assert(re.replace("mail ann@home now", "$2 at $1") == "mail home at ann now");
+    /// ```
+    pub fn replace<R: Replacer>(self, h: str, rep: R) -> str { self.replacen(h, 1, rep) }
+
+    /// `h` with every match replaced by `rep`.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"\s+");
+    /// assert(re.replace_all("a  b \t c", " ") == "a b c");
+    /// ```
+    pub fn replace_all<R: Replacer>(self, h: str, rep: R) -> str { self.replacen(h, 0, rep) }
+
+    /// `h` with the first `limit` matches replaced by `rep`; `limit` 0
+    /// replaces all of them.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new("a");
+    /// assert(re.replacen("aaaa", 2, "b") == "bbaa");
+    /// ```
+    pub fn replacen<R: Replacer>(self, h: str, limit: usize, rep: R) -> str {
+        let out = StrBuf::new();
+        let last = 0usize;
+        let count = 0usize;
+        let fixed = rep.fixed();
+        let it = self.find_iter(h);
+        loop {
+            if limit > 0 && count >= limit { break; }
+            let m = it.next() ?? { break; };
+            out.push_str(h[last:m.s]);
+            if let f: str = fixed {
+                out.push_str(f);
+            } else {
+                rep.append(self.groups_of(m), out);
+            }
+            last = m.e;
+            count += 1;
+        }
+        if count == 0 { return h; }
+        out.push_str(h[last:]);
+        out.to_str()
+    }
+}

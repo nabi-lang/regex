@@ -1,0 +1,50 @@
+// replace, replace_all, replacen: templates, literals, functions.
+
+use pkg::tests::suite::re;
+use pkg::{Captures, NoExpand};
+
+#[test]
+fn templates() {
+    let r = re(r"(?<y>\d{4})-(?<m>\d{2})-(?<d>\d{2})");
+    assert(r.replace("on 2026-11-14 and 2025-01-02", "$d/$m/$y") == "on 14/11/2026 and 2025-01-02");
+    assert(r.replace_all("on 2026-11-14 and 2025-01-02", "${d}.${m}.${y}") == "on 14.11.2026 and 02.01.2025");
+    assert(r.replace_all("2026-11-14", "$1") == "2026");
+    assert(re(r"(\w+)").replace_all("ab cd", "<$1>") == "<ab> <cd>");
+    assert(re(r"(\w+)").replace_all("ab cd", "$1_") == " ");
+    assert(re(r"(\w+)").replace_all("ab cd", "${1}_") == "ab_ cd_");
+    assert(re("a").replace_all("aXa", "$$") == "$X$");
+    assert(re("x").replace_all("axb", "[$0]") == "a[x]b");
+}
+
+#[test]
+fn literal_and_limits() {
+    let r = re("a");
+    assert(r.replace("banana", "o") == "bonana");
+    assert(r.replace_all("banana", "o") == "bonono");
+    assert(r.replacen("banana", 2, "o") == "bonona");
+    assert(r.replacen("banana", 0, "o") == "bonono");
+    assert(r.replacen("banana", 9, "o") == "bonono");
+    assert(r.replace_all("xyz", "o") == "xyz");
+    assert(r.replace_all("", "o") == "");
+    assert(re("x").replace_all("axb", NoExpand("$1")) == "a$1b");
+    assert(re("").replace_all("abc", "-") == "-a-b-c-");
+    assert(re("").replace_all("é", "-") == "-é-");
+    assert(re("a*").replace_all("baaac", "-") == "-b-c-");
+}
+
+#[test]
+fn functions() {
+    let r = re(r"\d+");
+    let f = |c: Captures| f"<{c[0].len()}>";
+    assert(r.replace_all("a1 b22 c333", f) == "a<1> b<2> c<3>");
+    let up = re(r"\b(\w)(\w*)").replace_all("hello big world", |c: Captures| c[1].to_uppercase() + c[2]);
+    assert(up == "Hello Big World");
+    assert(r.replacen("1 2 3", 2, |c: Captures| c[0] + c[0]) == "11 22 3");
+}
+
+#[test]
+fn unicode_text() {
+    assert(re("é").replace_all("café é", "e") == "cafe e");
+    assert(re(r"\p{Greek}+").replace_all("α and βγ", "[$0]") == "[α] and [βγ]");
+    assert(re("(?i)straße").replace_all("STRASSE STRAßE", "x") == "STRASSE x");
+}

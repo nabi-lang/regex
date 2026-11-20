@@ -1,0 +1,139 @@
+// Many patterns in one program, searched in one pass.
+
+use pkg::RegexError;
+use pkg::dfa::{Dfa, GAVE_UP};
+use pkg::hir::Hir;
+use pkg::parse::Flags;
+use pkg::pike::{Pike, WANT_ALL, WANT_EARLIEST};
+use pkg::prefilter::Prefilter;
+use pkg::prog::Prog;
+
+/// A set of patterns matched together: which of them match `h`, in one
+/// linear pass however many there are.
+///
+/// ```nabi
+/// use regex::RegexSet;
+///
+/// let set = try RegexSet::new([r"\d+", r"[a-z]+", r"^x"]);
+/// let m = set.matches("abc 42");
+/// assert(m.matched(0) && m.matched(1) && !m.matched(2));
+/// assert(m.iter() == [0, 1]);
+/// ```
+pub struct RegexSet {
+    pats: List<str>;
+    prog: Prog;
+    pike: Pike;
+    dfa: Dfa;
+    /// Where a match of some pattern may start.
+    pf: Prefilter;
+}
+
+/// Which patterns of a `RegexSet` matched.
+#[derive(Clone, PartialEq, Debug)]
+pub struct SetMatches {
+    hits: List<bool>;
+}
+
+impl SetMatches {
+    /// Whether pattern `i` matched.
+    ///
+    /// ```nabi
+    /// let set = try regex::RegexSet::new(["a", "b"]);
+    /// assert(set.matches("b").matched(1));
+    /// ```
+    pub fn matched(self, i: usize) -> bool { i < self.hits.len() && self.hits[i] }
+
+    /// Whether any pattern matched.
+    ///
+    /// ```nabi
+    /// let set = try regex::RegexSet::new(["a", "b"]);
+    /// assert(!set.matches("c").matched_any());
+    /// ```
+    pub fn matched_any(self) -> bool { self.hits.contains(true) }
+
+    /// The indexes of the patterns that matched, ascending.
+    ///
+    /// ```nabi
+    /// let set = try regex::RegexSet::new(["a", "b", "c"]);
+    /// assert(set.matches("ca").iter() == [0, 2]);
+    /// ```
+    pub fn iter(self) -> List<usize> {
+        let out: List<usize> = List::new();
+        for i in 0..self.hits.len() {
+            if self.hits[i] { out.push(i); }
+        }
+        out
+    }
+
+    /// The number of patterns in the set.
+    ///
+    /// ```nabi
+    /// assert((try regex::RegexSet::new(["a", "b"])).matches("").len() == 2);
+    /// ```
+    pub fn len(self) -> usize { self.hits.len() }
+}
+
+impl RegexSet {
+    /// Compiles every pattern of `patterns` with the default options.
+    /// An error names the pattern by its position in the message.
+    ///
+    /// ```nabi
+    /// let bad = try { _ = try regex::RegexSet::new(["a", "("]); "" } catch e: regex::RegexError { f"{e}" };
+    /// assert(bad.contains("unclosed group"));
+    /// ```
+    pub fn new(patterns: List<str>) throws (RegexError) -> RegexSet {
+        let flags = Flags { i: false, m: false, s: false, x: false, swap: false, u: true };
+        let hirs: List<Hir> = List::new();
+        for p in patterns { hirs.push((try pkg::parse::parse(p, flags)).hir); }
+        // an empty set never matches
+        if hirs.is_empty() { hirs.push(Hir::Class([])); }
+        let limit = pkg::engine::DEFAULT_SIZE_LIMIT;
+        let prog = try pkg::compile::compile(hirs, 1, false, false, limit);
+        let pf = pkg::prefilter::build("", prog);
+        RegexSet { pats: patterns.clone(), prog: prog, pike: pkg::pike::new(prog), dfa: pkg::dfa::new(prog, false, pkg::engine::DEFAULT_DFA_SIZE_LIMIT), pf: pf }
+    }
+
+    /// Whether any pattern matches `h`.
+    ///
+    /// ```nabi
+    /// let set = try regex::RegexSet::new([r"^\d+$", "x"]);
+    /// assert(set.is_match("123") && !set.is_match("12a"));
+    /// ```
+    pub fn is_match(self, h: str) -> bool {
+        if self.pats.is_empty() { return false; }
+        let e = self.dfa.forward(h, 0, h.len(), false, true, self.pf);
+        if e != GAVE_UP { return e >= 0i64; }
+        let slots: List<i64> = [-1i64, -1i64];
+        pkg::pike::search(self.prog, self.pike, h, 0, h.len(), false, WANT_EARLIEST, slots, 0)
+    }
+
+    /// Which patterns match `h`.
+    ///
+    /// ```nabi
+    /// let set = try regex::RegexSet::new(["foo", "bar", "baz"]);
+    /// assert(set.matches("foobaz").iter() == [0, 2]);
+    /// ```
+    pub fn matches(self, h: str) -> SetMatches {
+        let flags: List<i64> = List::filled(self.pats.len(), 0i64);
+        if !self.pats.is_empty() {
+            _ = pkg::pike::search(self.prog, self.pike, h, 0, h.len(), false, WANT_ALL, flags, 0);
+        }
+        let hits: List<bool> = List::with_capacity(flags.len());
+        for f in flags { hits.push(f != 0i64); }
+        SetMatches { hits: hits }
+    }
+
+    /// The number of patterns.
+    ///
+    /// ```nabi
+    /// assert((try regex::RegexSet::new(["a", "b"])).len() == 2);
+    /// ```
+    pub fn len(self) -> usize { self.pats.len() }
+
+    /// The patterns as written.
+    ///
+    /// ```nabi
+    /// assert((try regex::RegexSet::new(["a+", "b"])).patterns() == ["a+", "b"]);
+    /// ```
+    pub fn patterns(self) -> List<str> { self.pats.clone() }
+}

@@ -1,0 +1,108 @@
+// Groups: numbering, names, groups that take no part, nesting and
+// repetition, the `Captures` API.
+
+use pkg::tests::suite::{re, some};
+use pkg::{Captures, Match};
+
+fn group(p: str, h: str, i: usize) -> str | none {
+    let c = re(p).captures(h) ?? { return none; };
+    if let m: Match = c.get(i) { m.as_str() } else { none }
+}
+
+#[test]
+fn numbering() {
+    let c = some(re(r"(\d+)-(\d+)").captures("tel 555-1234"));
+    assert(c.len() == 3);
+    assert(c[0] == "555-1234" && c[1] == "555" && c[2] == "1234");
+    assert(some(c.get(1)).start() == 4 && some(c.get(2)).range() == (8..12));
+    assert(c.get(3) == none);
+    assert(re("(a)(?:b)(c)").captures_len() == 3);
+    assert(re("a").captures_len() == 1);
+    assert(some(re("((a)(b))").captures("ab"))[3] == "b");
+}
+
+#[test]
+fn names() {
+    let r = re(r"(?<y>\d{4})-(?P<m>\d{2})-(\d{2})");
+    assert(r.capture_names() == [none, "y", "m", none]);
+    let c = some(r.captures("2026-11-14"));
+    assert(c["y"] == "2026" && c["m"] == "11" && c[3] == "14");
+    assert(some(c.name("y")).start() == 0);
+    assert(c.name("d") == none);
+    assert(some(re("(?<a.b[0]>x)").captures("x"))["a.b[0]"] == "x");
+}
+
+#[test]
+fn optional_groups() {
+    assert(group("(a)|(b)", "b", 1) == none);
+    assert(group("(a)|(b)", "b", 2) == "b");
+    assert(group("(a)?b", "b", 1) == none);
+    assert(group("(a*)b", "b", 1) == "");
+    assert(group("(a)*", "aaa", 1) == "a");
+    assert(group("(ab|a)(bc|c)?", "abc", 1) == "ab");
+    assert(group("(ab|a)(bc|c)?", "abc", 2) == "c");
+    assert(group("(a|ab)(c|bcd)(d*)", "abcd", 2) == "bcd");
+    assert(group("(a|ab)(c|bcd)(d*)", "abcd", 3) == "");
+    // the last iteration wins
+    assert(group("(?:(a)|(b))+", "ab", 1) == "a");
+    assert(group("(?:(a)|(b))+", "ab", 2) == "b");
+    assert(group("(?:(a)|b)+", "ab", 1) == "a");
+    assert(group("(a)|b", "b", 0) == "b");
+}
+
+#[test]
+fn nested_and_empty() {
+    assert(group("((a)|(b))+", "ab", 1) == "b");
+    assert(group("((a)|(b))+", "ab", 2) == "a");
+    // `x*` with an `x` that can be empty runs as `(x+)?`, so the group
+    // takes part
+    assert(group("(a*)*", "b", 1) == "");
+    assert(group("(a*)*", "aa", 1) == "aa");
+    assert(group("(a*)+", "aa", 1) == "aa");
+    assert(group("(a|)+b", "aab", 1) == "a");
+    assert(group("()", "x", 1) == "");
+}
+
+#[test]
+fn captures_at_context() {
+    let r = re(r"\b(\w)");
+    assert(some(r.captures_at("ab cd", 1))[1] == "c");
+    assert(re("^(a)").captures_at("aa", 1) == none);
+}
+
+#[test]
+fn iter_and_debug() {
+    let c = some(re("(a)(x)?(b)").captures("ab"));
+    let texts: List<str> = List::new();
+    for m in c.iter() { texts.push(if let x: Match = m { x.as_str() } else { "-" }); }
+    assert(texts == ["ab", "a", "-", "b"]);
+    let d = f"{c:?}";
+    assert(d.contains("none") && d.contains("\"a\""));
+    let n = some(re("(?<k>a)").captures("a"));
+    assert(f"{n:?}".contains("k: "));
+}
+
+#[test]
+fn captures_iter() {
+    let pairs: List<str> = re(r"(\w+)=(\w*)").captures_iter("a=1 b= c=33").map(|c: Captures| f"{c[1]}:{c[2]}").collect();
+    assert(pairs == ["a:1", "b:", "c:33"]);
+    let n = 0;
+    for _ in re("x").captures_iter("") { n += 1; }
+    assert(n == 0);
+}
+
+#[test]
+fn expand() {
+    let c = some(re(r"(?<first>\w+)\s(?<last>\w+)").captures("Ada Lovelace"));
+    assert(c.expand("$last, $first") == "Lovelace, Ada");
+    assert(c.expand("${2}${1}") == "LovelaceAda");
+    assert(c.expand("$2$1") == "LovelaceAda");
+    assert(c.expand("$1x") == "");
+    assert(c.expand("${1}x") == "Adax");
+    assert(c.expand("$$1") == "$1");
+    assert(c.expand("$9 $nope") == " ");
+    assert(c.expand("cost $") == "cost $");
+    assert(c.expand("$-") == "$-");
+    assert(c.expand("${unclosed") == "${unclosed");
+    assert(c.expand("") == "");
+}

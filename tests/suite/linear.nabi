@@ -1,0 +1,37 @@
+// Patterns that take exponential time in a backtracking engine finish
+// here in time linear in the input. Each haystack below would never
+// finish under backtracking.
+
+use pkg::tests::suite::{re, some};
+
+#[test]
+fn nested_stars() {
+    let h = "a".repeat(100000);
+    assert(re("(a*)*b").find(h) == none);
+    assert(re("(a*)*b").captures(h) == none);
+    assert(re("(a+)+b").find(h) == none);
+    assert(re("(a|a)*b").find(h) == none);
+    assert(re("(a|aa)*c").find(h) == none);
+    assert(some(re("(?:a?){50}a{50}").find("a".repeat(50))).len() == 50);
+    assert(some(re("(a*)*$").find(h)).len() == 100000);
+    let c = some(re("(a|aa)*c").captures(h + "c"));
+    assert(c[0].len() == 100001);
+}
+
+#[test]
+fn alternations_and_classes() {
+    let h = "x".repeat(50000) + "y";
+    assert(re(r"(x+x+)+z").find(h) == none);
+    assert(re(r"(\w+\s?)+$").is_match("word ".repeat(10000)));
+    assert(re(r"^(\d+)*$").find("1".repeat(50000) + "a") == none);
+    assert(re(r"(.*a){20}").find("a".repeat(30)) != none);
+    assert(re(r"(?:[a-z]+|[a-z0-9]+)*!").find("ab1".repeat(20000)) == none);
+}
+
+#[test]
+fn pikevm_path() {
+    // Unicode \b with non-ASCII text, and groups: both on the PikeVM
+    let h = "é".repeat(20000);
+    assert(re(r"\b(é*)*x").find(h) == none);
+    assert(re(r"(é*)*x").captures(h) == none);
+}

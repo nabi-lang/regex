@@ -1,0 +1,100 @@
+// find_iter, split and splitn, with empty matches and multibyte text.
+
+use pkg::tests::suite::{all, re, some, spans};
+
+#[test]
+fn find_iter() {
+    assert(all(r"\d+", "a1b22c333") == ["1", "22", "333"]);
+    assert(all("x", "") == []);
+    assert(all("a", "aaa") == ["a", "a", "a"]);
+    assert(all("aa", "aaaaa") == ["aa", "aa"]);
+    assert(spans("[a-z]+", "ab12cd") == [(0, 2), (4, 6)]);
+}
+
+#[test]
+fn empty_matches() {
+    // an empty match right after a match is skipped
+    assert(spans("a*", "baaab") == [(0, 0), (1, 4), (5, 5)]);
+    assert(spans("", "abc") == [(0, 0), (1, 1), (2, 2), (3, 3)]);
+    assert(spans("", "") == [(0, 0)]);
+    assert(spans("a*?", "aa") == [(0, 0), (1, 1), (2, 2)]);
+    assert(spans("x*", "xax") == [(0, 1), (2, 3)]);
+    assert(spans(r"\b", "a b") == [(0, 0), (1, 1), (2, 2), (3, 3)]);
+    assert(spans("a|", "aba") == [(0, 1), (2, 3)]);
+    assert(spans("", "é") == [(0, 0), (2, 2)]);
+    assert(spans("(?:)", "😀a") == [(0, 0), (4, 4), (5, 5)]);
+}
+
+#[test]
+fn find_at_context() {
+    let r = re("^a");
+    assert(r.find_at("aa", 1) == none);
+    let w = re(r"\ba");
+    assert(some(w.find_at("ba a", 1)).start() == 3);
+    assert(re("a").find_at("a", 2) == none);
+    assert(some(re("").find_at("ab", 2)).start() == 2);
+    assert(some(re("(?m)^b").find_at("a\nb", 1)).start() == 2);
+}
+
+#[test]
+fn split() {
+    let r = re(r"\s*,\s*");
+    let p: List<str> = r.split("a , b,c ,d").collect();
+    assert(p == ["a", "b", "c", "d"]);
+    let q: List<str> = re(",").split(",a,,b,").collect();
+    assert(q == ["", "a", "", "b", ""]);
+    let e: List<str> = re(",").split("").collect();
+    assert(e == [""]);
+    let n: List<str> = re("x").split("abc").collect();
+    assert(n == ["abc"]);
+    let chars: List<str> = re("").split("abc").collect();
+    assert(chars == ["", "a", "b", "c", ""]);
+    let multi: List<str> = re("").split("é😀").collect();
+    assert(multi == ["", "é", "😀", ""]);
+}
+
+#[test]
+fn splitn() {
+    let r = re(",");
+    let a: List<str> = r.splitn("a,b,c", 0).collect();
+    assert(a == []);
+    let b: List<str> = r.splitn("a,b,c", 1).collect();
+    assert(b == ["a,b,c"]);
+    let c: List<str> = r.splitn("a,b,c", 2).collect();
+    assert(c == ["a", "b,c"]);
+    let d: List<str> = r.splitn("a,b,c", 3).collect();
+    assert(d == ["a", "b", "c"]);
+    let e: List<str> = r.splitn("a,b,c", 9).collect();
+    assert(e == ["a", "b", "c"]);
+    let f: List<str> = r.splitn("a,", 2).collect();
+    assert(f == ["a", ""]);
+}
+
+#[test]
+fn shortest_and_is_match() {
+    let r = re("a+");
+    assert(some(r.shortest_match("baaa")) == 2);
+    assert(r.shortest_match("bbb") == none);
+    assert(some(re("abc|a").shortest_match("abc")) == 1);
+    assert(some(re("").shortest_match("x")) == 0);
+    assert(some(re("lit").shortest_match("a lit")) == 5);
+    assert(some(re("$").shortest_match("ab")) == 2);
+    assert(r.is_match("xa") && !r.is_match("xyz"));
+    assert(re(r"\bb").is_match_at("a b", 1));
+    assert(!re(r"\bb").is_match_at("ab", 1));
+}
+
+#[test]
+fn long_haystacks() {
+    let h = "ab".repeat(50000) + "needle" + "cd".repeat(50000);
+    let r = re(r"ne+dle");
+    assert(some(r.find(h)).start() == 100000);
+    assert(some(re(r"[a-z]+").find(h)).len() == h.len());
+    assert(some(re(r"(?:ab)+").find(h)).end() == 100000);
+    let count = 0;
+    for _ in re("b").find_iter(h) { count += 1; }
+    assert(count == 50000);
+    // Unicode \b on non-ASCII text runs on the PikeVM
+    let u = "é ".repeat(20000) + "fin";
+    assert(some(re(r"\bfin\b").find(u)).start() == 60000);
+}

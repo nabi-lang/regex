@@ -1,0 +1,68 @@
+// Searches over 1 MiB of English-like ASCII text with a rare needle at
+// the end. Bytes are haystack bytes, so bytes/s is the scan rate.
+
+use pkg::Regex;
+use core::bench::Bench;
+use core::hint::black_box;
+
+fn text() -> str {
+    let words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "and", "runs", "far", "away"];
+    let b = StrBuf::new();
+    let i = 0usize;
+    while b.len() < 1048576 {
+        b.push_str(words[(i * 7 + i / 3) % words.len()]);
+        b.push(if i % 11 == 10 { '\n' } else { ' ' });
+        i += 1;
+    }
+    b.push_str("Sherlock Holmes 221B");
+    b.to_str()
+}
+
+fn run(b: Bench, pattern: str) {
+    let h = text();
+    let re = try! Regex::new(pattern);
+    b.set_bytes(h.len() as i64);
+    b.iter(|| re.find(black_box(h)));
+}
+
+/// A plain literal: a substring search.
+#[bench]
+fn literal(b: Bench) { run(b, "Sherlock"); }
+
+/// A literal prefix, then the DFA.
+#[bench]
+fn prefix(b: Bench) { run(b, r"Sherlock\s+\w+"); }
+
+/// Alternation of literals, on the DFA.
+#[bench]
+fn alternation(b: Bench) { run(b, "Sherlock|Holmes|Watson"); }
+
+/// Case-insensitive literal, on the DFA.
+#[bench]
+fn nocase(b: Bench) { run(b, "(?i)sherlock"); }
+
+/// A class-heavy pattern: Unicode classes on the DFA.
+#[bench]
+fn classes(b: Bench) { run(b, r"[A-Z]\w+\s+\d+\p{Lu}"); }
+
+/// `is_match` of a pattern that only matches at the end.
+#[bench]
+fn is_match(b: Bench) {
+    let h = text();
+    let re = try! Regex::new(r"\d{3}[A-Z]");
+    b.set_bytes(h.len() as i64);
+    b.iter(|| re.is_match(black_box(h)));
+}
+
+/// Every word of the text.
+#[bench]
+fn words(b: Bench) {
+    let h = text();
+    let re = try! Regex::new(r"\w+");
+    b.set_bytes(h.len() as i64);
+    b.iter(|| {
+        let n = 0;
+        for _ in re.find_iter(black_box(h)) { n += 1; }
+        n
+    });
+}

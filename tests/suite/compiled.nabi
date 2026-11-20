@@ -1,0 +1,22 @@
+// `regex!`: checked when compiled, built once per thread.
+
+use pkg::regex!;
+
+#[test]
+fn matches_like_new() {
+    let re = regex!(r"(\d{4})-(\d{2})");
+    assert(re.is_match("on 2026-11"));
+    assert((re.find("on 2026-11") ?? panic("no match")).as_str() == "2026-11");
+    assert((regex!(r"\p{Greek}+").find("abc αβγ") ?? panic("no match")).as_str() == "αβγ");
+    assert(regex!("(?i)straße").is_match("STRAßE"));
+}
+
+#[test]
+fn one_regex_per_call_site() {
+    let n = 0;
+    for w in ["a1", "b", "c22", "d"] {
+        if regex!(r"\d").is_match(w) { n += 1; }
+    }
+    assert(n == 2);
+    assert(regex!(r"\d").as_str() == r"\d");
+}

@@ -1,0 +1,170 @@
+// A one-pass DFA: for a pattern where every byte of a match leaves one
+// way to go on (`(\d+)-(\w+)`, not `(a*)(a*)`), the groups of a match
+// come from one scan that sets slots on the way, without the PikeVM's
+// thread lists. Built when the regex is, only when the pattern is
+// one-pass; otherwise, and whenever a scan cannot decide, the PikeVM
+// takes over.
+//
+// A state is where a byte was just read (or the start): the threads its
+// epsilon closure reaches. Each byte has at most one edge, carrying the
+// slots saved before the byte is read. Looks count as holding: along
+// the one path the bytes force, any look on it held, or there would be
+// no match.
+
+use pkg::prog::{OP_LOOK, OP_MATCH, OP_RANGES, OP_SAVE, OP_SPLIT, Prog};
+
+/// Most states, so the tables stay small.
+const MAX_STATES: usize = 256;
+
+pub(pkg) struct OnePass {
+    /// Byte to class (empty: not one-pass).
+    cls: List<usize>;
+    /// Per state and class: the next state, or -1.
+    next: List<i32>;
+    /// Per state and class: the slots saved before the byte (a bit each).
+    save: List<u64>;
+    /// Per state: the slots saved at a match, then whether a match is
+    /// there (bit 0 of `info`) and comes before every edge (bit 1).
+    msave: List<u64>;
+    info: List<u8>;
+}
+
+pub(pkg) fn empty() -> OnePass {
+    OnePass { cls: List::new(), next: List::new(), save: List::new(), msave: List::new(), info: List::new() }
+}
+
+/// The one-pass DFA of `p` (a program with capture slots), or `empty()`.
+pub(pkg) fn build(p: Prog) -> OnePass {
+    if p.slots() > 64 { return empty(); }
+    // byte classes: the bytes no transition tells apart
+    let cut: List<bool> = List::filled(257, false);
+    cut[0] = true;
+    for t in 0..p.tlo.len() {
+        cut[p.tlo[t] as usize] = true;
+        cut[(p.thi[t] + 1) as usize] = true;
+    }
+    let cls: List<usize> = List::filled(256, 0usize);
+    let c = 0usize;
+    for b in 0..256 {
+        if b > 0 && cut[b] { c += 1; }
+        cls[b] = c;
+    }
+    let ncls = c + 1;
+    let op = OnePass { cls: cls, next: List::new(), save: List::new(), msave: List::new(), info: List::new() };
+    let roots: List<i32> = [p.start()];
+    let index: Dict<i32, i32> = Dict::new();
+    index.insert(p.start(), 0);
+    // per closure: reached pcs and the slots saved on the way
+    let seen: List<i32> = List::filled(p.len(), -1);
+    let mask: List<u64> = List::filled(p.len(), 0u64);
+    let stk: List<i32> = List::new();
+    let smask: List<u64> = List::new();
+    let s = 0usize;
+    while s < roots.len() {
+        if roots.len() > MAX_STATES { return empty(); }
+        for _ in 0..ncls {
+            op.next.push(-1);
+            op.save.push(0u64);
+        }
+        op.msave.push(0u64);
+        op.info.push(0u8);
+        let edges = false;
+        stk.clear();
+        smask.clear();
+        stk.push(roots[s]);
+        smask.push(0u64);
+        while !stk.is_empty() {
+            let pc = stk.pop() ?? -1;
+            let m = smask.pop() ?? 0u64;
+            if pc < 0 { continue; }
+            let u = pc as usize;
+            if seen[u] == s as i32 {
+                // two ways to one place: the slots must agree
+                if mask[u] != m { return empty(); }
+                continue;
+            }
+            seen[u] = s as i32;
+            mask[u] = m;
+            let o = p.op[u];
+            if o == OP_SPLIT {
+                stk.push(p.b[u]);
+                smask.push(m);
+                stk.push(p.next[u]);
+                smask.push(m);
+            } else if o == OP_SAVE {
+                stk.push(p.next[u]);
+                smask.push(m | (1u64 << (p.a[u] as u64)));
+            } else if o == OP_LOOK {
+                stk.push(p.next[u]);
+                smask.push(m);
+            } else if o == OP_MATCH {
+                if (op.info[s] & 1u8) != 0u8 { return empty(); }
+                op.info[s] = if edges { 1u8 } else { 3u8 };
+                op.msave[s] = m;
+            } else if o == OP_RANGES {
+                edges = true;
+                let lo = p.a[u] as usize;
+                for t in lo..lo + p.b[u] as usize {
+                    let to = p.tnext[t];
+                    let id = index.get(to) ?? {
+                        let k = roots.len() as i32;
+                        roots.push(to);
+                        index.insert(to, k);
+                        k
+                    };
+                    let x = cls[p.tlo[t] as usize];
+                    let y = cls[p.thi[t] as usize];
+                    for k in x..y + 1 {
+                        let at = s * ncls + k;
+                        // a second way on for this byte: not one-pass
+                        if op.next[at] >= 0 && (op.next[at] != id || op.save[at] != m) { return empty(); }
+                        op.next[at] = id;
+                        op.save[at] = m;
+                    }
+                }
+            }
+        }
+        s += 1;
+    }
+    op
+}
+
+impl OnePass {
+    pub(pkg) fn is_empty(self) -> bool { self.cls.is_empty() }
+
+    /// The first `k` slots of the match `h[start..end]` (which the DFA
+    /// found) into `slots`; `false` when this scan cannot tell (the
+    /// PikeVM then does).
+    pub(pkg) fn run(self, h: str, start: usize, end: usize, slots: List<i64>, k: usize) -> bool {
+        let b = h.as_bytes();
+        let cls = self.cls;
+        let next = self.next;
+        let save = self.save;
+        let info = self.info;
+        let ncls = next.len() / info.len();
+        let keep = if k >= 64 { 0xFFFFFFFFFFFFFFFFu64 } else { (1u64 << (k as u64)) - 1u64 };
+        let s = 0usize;
+        let at = start;
+        while at < end {
+            // a match before every edge here ends the match here
+            if info[s] == 3u8 { return false; }
+            let x = s * ncls + cls[b[at] as usize];
+            let t = next[x];
+            if t < 0 { return false; }
+            let m = save[x] & keep;
+            while m != 0u64 {
+                slots[m.trailing_zeros() as usize] = at as i64;
+                m &= m - 1u64;
+            }
+            s = t as usize;
+            at += 1;
+        }
+        if (info[s] & 1u8) == 0u8 { return false; }
+        let m = self.msave[s] & keep;
+        while m != 0u64 {
+            slots[m.trailing_zeros() as usize] = end as i64;
+            m &= m - 1u64;
+        }
+        true
+    }
+}

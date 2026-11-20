@@ -1,0 +1,47 @@
+// Groups and replacement: the PikeVM runs on each match the DFA finds.
+// Items are matches.
+
+use pkg::{Captures, Regex};
+use core::bench::Bench;
+use core::hint::black_box;
+
+const N: usize = 10000;
+
+fn log() -> str {
+    let b = StrBuf::new();
+    for i in 0..N {
+        b.push_str(f"2026-11-{(i % 28) + 1:02} 12:{i % 60:02}:07 host{i % 7} GET /api/item/{i} 200 {i * 13 % 997}ms\n");
+    }
+    b.to_str()
+}
+
+/// Five groups per line.
+#[bench]
+fn captures(b: Bench) {
+    let h = log();
+    let re = try! Regex::new(r"(?m)^(\d{4})-(\d{2})-(\d{2}) \S+ (\w+) GET (\S+)");
+    b.set_items(N as i64);
+    b.iter(|| {
+        let n = 0usize;
+        for c in re.captures_iter(black_box(h)) { n += c[5].len(); }
+        n
+    });
+}
+
+/// A template with two groups on every line.
+#[bench]
+fn replace(b: Bench) {
+    let h = log();
+    let re = try! Regex::new(r"host(\d) GET (\S+)");
+    b.set_items(N as i64);
+    b.iter(|| re.replace_all(black_box(h), "$2@$1"));
+}
+
+/// A function replacement.
+#[bench]
+fn replace_fn(b: Bench) {
+    let h = log();
+    let re = try! Regex::new(r"(\d+)ms");
+    b.set_items(N as i64);
+    b.iter(|| re.replace_all(black_box(h), |c: Captures| f"{c[1]} ms"));
+}

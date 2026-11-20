@@ -1,0 +1,141 @@
+// The PikeVM: runs every NFA thread in lockstep over the haystack, so a
+// search is O(haystack x program) whatever the pattern. Threads are kept
+// in priority order, which gives leftmost-first (Perl) semantics; the
+// thread that reaches `Match` first wins and every thread after it is
+// dropped.
+
+use pkg::look::holds;
+use pkg::prog::{OP_LOOK, OP_MATCH, OP_RANGES, OP_SAVE, OP_SPLIT, Prog};
+
+/// Scratch space for one program, reused across searches: thread
+/// lists `cd cs nd ns`, slot tables `ct nt`, `stk` and `cur`. Two
+/// fields, so a copy of the `Regex` holding it stays small.
+pub(pkg) struct Pike {
+    i: List<List<i32>>;
+    t: List<List<i64>>;
+}
+
+pub(pkg) fn new(p: Prog) -> Pike {
+    let n = p.len();
+    let k = p.slots();
+    Pike {
+        i: [List::filled(n, 0), List::filled(n, 0), List::filled(n, 0), List::filled(n, 0)],
+        t: [List::filled(n * k, -1i64), List::filled(n * k, -1i64), List::new(), List::filled(k, -1i64)],
+    }
+}
+
+/// What a search wants.
+pub(pkg) const WANT_FIRST: i32 = 0;
+/// Stop at the first match seen (any end).
+pub(pkg) const WANT_EARLIEST: i32 = 1;
+/// Every pattern that matches (RegexSet); `slots` gets one flag per
+/// pattern.
+pub(pkg) const WANT_ALL: i32 = 2;
+
+/// Searches `h[start..end]` (the rest of `h` is context for looks).
+/// Tracks the first `k` capture slots (at most `p.slots`; 0 for a yes or
+/// no answer). On a match fills `slots` (`k` values, or one flag per
+/// pattern for `WANT_ALL`) and returns true.
+pub(pkg) fn search(p: Prog, s: Pike, h: str, start: usize, end: usize, anchored: bool, want: i32, slots: List<i64>, k: usize) -> bool {
+    let cd = s.i[0];
+    let cs = s.i[1];
+    let nd = s.i[2];
+    let ns = s.i[3];
+    let ct = s.t[0];
+    let nt = s.t[1];
+    let stk = s.t[2];
+    let cur = s.t[3];
+    let clen = 0usize;
+    let matched = false;
+    let at = start;
+    loop {
+        if (!matched || want == WANT_ALL) && (at == start || !anchored) && (at == h.len() || (h.byte(at) & 0xC0u8) != 0x80u8) {
+            for j in 0..k { cur[j] = -1i64; }
+            clen = add(p, h, cd, cs, clen, ct, k, p.start(), at, cur, stk);
+        }
+        if clen == 0 && ((matched && want != WANT_ALL) || anchored) { break; }
+        let nlen = 0usize;
+        let b: i32 = if at < end { h.byte(at) as i32 } else { -1 };
+        for i in 0..clen {
+            let pc = cd[i];
+            let op = p.op[pc as usize];
+            if op == OP_MATCH {
+                if want == WANT_ALL {
+                    slots[p.a[pc as usize] as usize] = 1i64;
+                    matched = true;
+                    continue;
+                }
+                matched = true;
+                let base = (pc as usize) * k;
+                for j in 0..k { slots[j] = ct[base + j]; }
+                if want == WANT_EARLIEST { return true; }
+                break;
+            }
+            if b < 0 || op != OP_RANGES { continue; }
+            let t = p.step(pc, b);
+            if t < 0 { continue; }
+            if k > 0 {
+                let base = (pc as usize) * k;
+                for j in 0..k { cur[j] = ct[base + j]; }
+            }
+            nlen = add(p, h, nd, ns, nlen, nt, k, t, at + 1, cur, stk);
+        }
+        // swap the lists
+        (cd, nd) = (nd, cd);
+        (cs, ns) = (ns, cs);
+        (ct, nt) = (nt, ct);
+        clen = nlen;
+        if at >= end { break; }
+        at += 1;
+    }
+    matched
+}
+
+/// Adds `pc0` and its epsilon closure at `at` to the list, in priority
+/// order; returns the new length. `cur` holds the slots of the thread.
+fn add(p: Prog, h: str, d: List<i32>, sp: List<i32>, len: usize, ts: List<i64>, k: usize, pc0: i32, at: usize, cur: List<i64>, stk: List<i64>) -> usize {
+    let n = len;
+    stk.push(pc0 as i64);
+    while !stk.is_empty() {
+        let top = stk.pop() ?? 0i64;
+        if top < 0i64 {
+            // restore a slot: the value is under the marker
+            let v = stk.pop() ?? -1i64;
+            cur[(-top - 1i64) as usize] = v;
+            continue;
+        }
+        let pc = top as i32;
+        while pc >= 0 {
+            let x = sp[pc as usize] as usize;
+            if x < n && d[x] == pc { break; }
+            sp[pc as usize] = n as i32;
+            d[n] = pc;
+            n += 1;
+            let op = p.op[pc as usize];
+            if op == OP_RANGES || op == OP_MATCH {
+                if k > 0 {
+                    let base = (pc as usize) * k;
+                    for j in 0..k { ts[base + j] = cur[j]; }
+                }
+                break;
+            }
+            if op == OP_SPLIT {
+                stk.push(p.b[pc as usize] as i64);
+                pc = p.next[pc as usize];
+            } else if op == OP_SAVE {
+                let slot = p.a[pc as usize] as usize;
+                if slot < k {
+                    stk.push(cur[slot]);
+                    stk.push(-(slot as i64) - 1i64);
+                    cur[slot] = at as i64;
+                }
+                pc = p.next[pc as usize];
+            } else if op == OP_LOOK {
+                if holds(p.a[pc as usize], h, at) { pc = p.next[pc as usize]; } else { break; }
+            } else {
+                break;
+            }
+        }
+    }
+    n
+}

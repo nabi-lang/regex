@@ -1,0 +1,56 @@
+// Empty-width assertions at a byte offset of the haystack. The text
+// outside the searched span still counts, so `\b` at the start of a
+// span looks at the byte before it.
+
+use pkg::hir::{LOOK_END_LINE, LOOK_END_TEXT, LOOK_NOT_WORD, LOOK_NOT_WORD_ASCII, LOOK_START_LINE, LOOK_START_TEXT, LOOK_WORD, LOOK_WORD_ASCII, LOOK_WORD_END, LOOK_WORD_END_ASCII, LOOK_WORD_START, LOOK_WORD_START_ASCII};
+use pkg::unicode::is_word;
+
+/// The code point that starts at byte `i` (`i < h.len()`, a char
+/// boundary).
+pub(pkg) fn char_at(h: str, i: usize) -> u32 {
+    let b0 = h.byte(i) as u32;
+    if b0 < 0x80u32 { return b0; }
+    if b0 < 0xE0u32 { return ((b0 & 0x1Fu32) << 6) | (h.byte(i + 1) as u32 & 0x3Fu32); }
+    if b0 < 0xF0u32 {
+        return ((b0 & 0x0Fu32) << 12) | ((h.byte(i + 1) as u32 & 0x3Fu32) << 6) | (h.byte(i + 2) as u32 & 0x3Fu32);
+    }
+    ((b0 & 0x07u32) << 18) | ((h.byte(i + 1) as u32 & 0x3Fu32) << 12) | ((h.byte(i + 2) as u32 & 0x3Fu32) << 6) | (h.byte(i + 3) as u32 & 0x3Fu32)
+}
+
+/// The code point that ends at byte `i` (`i > 0`, a char boundary).
+pub(pkg) fn char_before(h: str, i: usize) -> u32 {
+    let j = i - 1;
+    while j > 0 && (h.byte(j) & 0xC0u8) == 0x80u8 { j -= 1; }
+    char_at(h, j)
+}
+
+/// The byte length of the char starting with byte `b`.
+pub(pkg) fn width(b: u8) -> usize {
+    if b < 0x80u8 { 1 } else if b < 0xE0u8 { 2 } else if b < 0xF0u8 { 3 } else { 4 }
+}
+
+fn word_ascii(b: u8) -> bool {
+    (b >= 0x30u8 && b <= 0x39u8) || (b >= 0x41u8 && b <= 0x5Au8) || (b >= 0x61u8 && b <= 0x7Au8) || b == 0x5Fu8
+}
+
+pub(pkg) fn holds(kind: i32, h: str, at: usize) -> bool {
+    let n = h.len();
+    if kind == LOOK_START_TEXT { return at == 0; }
+    if kind == LOOK_END_TEXT { return at == n; }
+    if kind == LOOK_START_LINE { return at == 0 || h.byte(at - 1) == 0x0Au8; }
+    if kind == LOOK_END_LINE { return at == n || h.byte(at) == 0x0Au8; }
+    let before = false;
+    let after = false;
+    if kind == LOOK_WORD_START_ASCII || kind == LOOK_WORD_END_ASCII || kind == LOOK_WORD_ASCII || kind == LOOK_NOT_WORD_ASCII {
+        before = at > 0 && word_ascii(h.byte(at - 1));
+        after = at < n && word_ascii(h.byte(at));
+    } else {
+        before = at > 0 && is_word(char_before(h, at));
+        after = at < n && is_word(char_at(h, at));
+    }
+    if kind == LOOK_WORD || kind == LOOK_WORD_ASCII { return before != after; }
+    if kind == LOOK_NOT_WORD || kind == LOOK_NOT_WORD_ASCII { return before == after; }
+    if kind == LOOK_WORD_START || kind == LOOK_WORD_START_ASCII { return !before && after; }
+    if kind == LOOK_WORD_END || kind == LOOK_WORD_END_ASCII { return before && !after; }
+    false
+}

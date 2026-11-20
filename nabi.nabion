@@ -1,0 +1,12 @@
+Package {
+    name: "regex",
+    version: "0.1.0",
+    nabi_version: "0.1.0",
+    toolchain: "0.1",
+    description: "Regular expressions in linear time: Thompson NFA, lazy DFA and PikeVM, Unicode classes and case folding, captures, replace, split, RegexSet",
+    license: "MIT OR Apache-2.0",
+    repository: "https://github.com/nabi-lang/regex",
+    keywords: ["regex", "regexp", "pattern", "text", "unicode"],
+    categories: ["text-processing", "parser-implementations"],
+    deps: {},
+}

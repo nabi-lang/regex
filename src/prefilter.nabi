@@ -1,0 +1,246 @@
+// Where a match may start, found faster than the DFA could: the
+// literal every match starts with, or the few bytes a match can have at
+// its first offsets (`[Hh]ello`, `(?i)abc`, `cat|dog`). A prefilter only
+// skips places no match starts at; the DFA still decides each match.
+
+use pkg::prog::{OP_LOOK, OP_MATCH, OP_RANGES, OP_SAVE, OP_SPLIT, Prog};
+use pkg::scan::{Finder, finder, memchr, memchr2, memchr3, memset, pair3, rank};
+
+const P_NONE: u32 = 0u32;
+const P_BYTE: u32 = 1u32;
+const P_BYTE2: u32 = 2u32;
+const P_BYTE3: u32 = 3u32;
+const P_SET: u32 = 4u32;
+const P_LIT: u32 = 5u32;
+const P_SEQ: u32 = 6u32;
+
+/// Most bytes a set prefilter may hold, and how common they may be.
+const SET_MAX: usize = 12;
+const SET_RANK: i32 = 200;
+
+/// Offsets looked at for `P_SEQ`, and NFA states followed per offset.
+const SEQ_MAX: usize = 8;
+const SEQ_STATES: usize = 64;
+
+pub(pkg) struct Prefilter {
+    /// The kind, then up to three bytes, a byte each.
+    k: u32;
+    /// `P_SET`: 256 flags.
+    set: List<bool>;
+    f: Finder;
+    /// `P_SEQ`: per offset, its bytes packed as for `pair3` (0 for any),
+    /// then the two offsets the scan uses.
+    seq: List<u32>;
+}
+
+pub(pkg) fn empty() -> Prefilter {
+    Prefilter { k: P_NONE, set: List::new(), f: finder(""), seq: List::new() }
+}
+
+/// The instructions reached from `pcs` without reading a byte: the
+/// `OP_RANGES` ones into `out`; `true` when a match is among them.
+/// Looks count as holding.
+fn closure(p: Prog, pcs: List<i32>, out: List<i32>) -> bool {
+    let seen: List<bool> = List::filled(p.len(), false);
+    let stk: List<i32> = List::new();
+    let k = pcs.len();
+    while k > 0 {
+        k -= 1;
+        stk.push(pcs[k]);
+    }
+    let matched = false;
+    while !stk.is_empty() {
+        let pc = stk.pop() ?? 0;
+        if pc < 0 || seen[pc as usize] { continue; }
+        seen[pc as usize] = true;
+        let op = p.op[pc as usize];
+        if op == OP_MATCH {
+            matched = true;
+        } else if op == OP_RANGES {
+            out.push(pc);
+        } else if op == OP_SPLIT {
+            stk.push(p.b[pc as usize]);
+            stk.push(p.next[pc as usize]);
+        } else if op == OP_SAVE || op == OP_LOOK {
+            stk.push(p.next[pc as usize]);
+        }
+    }
+    matched
+}
+
+/// The bytes a match of `p` (from `p.start`, anchored) can have at each
+/// offset, as 256 flags per offset, up to where a match may end. The
+/// sets may be larger than needed, never smaller.
+fn offsets(p: Prog) -> List<List<bool>> {
+    let out: List<List<bool>> = List::new();
+    let cur: List<i32> = [p.start()];
+    while out.len() < SEQ_MAX && cur.len() <= SEQ_STATES {
+        let rs: List<i32> = List::new();
+        if closure(p, cur, rs) || rs.is_empty() { break; }
+        let set: List<bool> = List::filled(256, false);
+        let next: List<i32> = List::new();
+        for pc in rs {
+            let lo = p.a[pc as usize] as usize;
+            for t in lo..lo + p.b[pc as usize] as usize {
+                for x in p.tlo[t]..p.thi[t] + 1 { set[x as usize] = true; }
+                next.push(p.tnext[t]);
+            }
+        }
+        out.push(set);
+        cur = next;
+    }
+    out
+}
+
+/// The bytes of `set` packed for `pair3`, or 0 past three bytes.
+fn pack(set: List<bool>) -> u32 {
+    let bs: List<u32> = List::new();
+    for x in 0..256 {
+        if !set[x] { continue; }
+        if bs.len() == 3 { return 0u32; }
+        bs.push(x as u32);
+    }
+    if bs.is_empty() { return 0u32; }
+    while bs.len() < 3 { bs.push(bs[0]); }
+    bs[0] | (bs[1] << 8u32) | (bs[2] << 16u32)
+}
+
+/// The worst rank of the bytes of `set`.
+fn rank_of(set: List<bool>) -> i32 {
+    let w: i32 = 0;
+    for x in 0..256 {
+        if set[x] { w = w.max(rank(x as u8)); }
+    }
+    w
+}
+
+/// Whether a match of `p` (from `p.start`, anchored) can read byte `x`.
+pub(pkg) fn reads(p: Prog, x: u8) -> bool {
+    let v = x as i32;
+    let seen: List<bool> = List::filled(p.len(), false);
+    let stk: List<i32> = [p.start()];
+    while !stk.is_empty() {
+        let pc = stk.pop() ?? 0;
+        if pc < 0 || seen[pc as usize] { continue; }
+        seen[pc as usize] = true;
+        let op = p.op[pc as usize];
+        if op == OP_RANGES {
+            let lo = p.a[pc as usize] as usize;
+            for t in lo..lo + p.b[pc as usize] as usize {
+                if p.tlo[t] <= v && v <= p.thi[t] { return true; }
+                stk.push(p.tnext[t]);
+            }
+        } else if op == OP_SPLIT {
+            stk.push(p.next[pc as usize]);
+            stk.push(p.b[pc as usize]);
+        } else if op == OP_SAVE || op == OP_LOOK {
+            stk.push(p.next[pc as usize]);
+        }
+    }
+    false
+}
+
+/// The prefilter for a program whose matches all start with `pre`.
+pub(pkg) fn build(pre: str, p: Prog) -> Prefilter {
+    let pf = empty();
+    if pre.len() >= 2 {
+        pf.k = P_LIT;
+        pf.f = finder(pre);
+        return pf;
+    }
+    let offs = offsets(p);
+    if offs.is_empty() { return pf; }
+    // the two rarest offsets of at most three bytes each
+    let packed: List<u32> = List::new();
+    let best = -1;
+    let second = -1;
+    for j in 0..offs.len() {
+        let bits = pack(offs[j]);
+        packed.push(bits);
+        if bits == 0u32 { continue; }
+        let r = rank_of(offs[j]);
+        if best < 0 || r < rank_of(offs[best as usize]) {
+            second = best;
+            best = j as i32;
+        } else if second < 0 || r < rank_of(offs[second as usize]) {
+            second = j as i32;
+        }
+    }
+    if best >= 0 && second >= 0 {
+        pf.k = P_SEQ;
+        packed.push(best as u32);
+        packed.push(second as u32);
+        pf.seq = packed;
+        return pf;
+    }
+    let set = offs[0];
+    let bs: List<u8> = List::new();
+    let common = false;
+    for x in 0..256 {
+        if set[x] {
+            bs.push(x as u8);
+            if rank(x as u8) >= SET_RANK { common = true; }
+        }
+    }
+    if bs.is_empty() || bs.len() > SET_MAX || (bs.len() > 3 && common) { return pf; }
+    if bs.len() > 3 {
+        pf.k = P_SET;
+        pf.set = set;
+        return pf;
+    }
+    let c1 = bs[bs.len().min(2) - 1] as u32;
+    let c2 = bs[bs.len() - 1] as u32;
+    pf.k = (bs.len() as u32) | ((bs[0] as u32) << 8u32) | (c1 << 16u32) | (c2 << 24u32);
+    pf
+}
+
+impl Prefilter {
+    pub(pkg) fn is_empty(self) -> bool { (self.k & 0xFFu32) == P_NONE }
+
+    /// The first place in `at..end` of `h` a match may start at, or -1.
+    pub(pkg) fn next(self, h: str, at: usize, end: usize) -> i64 {
+        let k = self.k & 0xFFu32;
+        if k == P_SEQ { return self.seq_next(h, at, end); }
+        if k == P_LIT { return self.f.find(h, at, end); }
+        let c0 = (self.k >> 8u32) as u8;
+        let c1 = (self.k >> 16u32) as u8;
+        let c2 = (self.k >> 24u32) as u8;
+        if k == P_BYTE { return memchr(h, at, end, c0); }
+        if k == P_BYTE2 { return memchr2(h, at, end, c0, c1); }
+        if k == P_BYTE3 { return memchr3(h, at, end, c0, c1, c2); }
+        if k == P_SET { return memset(h, at, end, self.set); }
+        at as i64
+    }
+
+    fn seq_next(self, h: str, at: usize, end: usize) -> i64 {
+        let q = self.seq;
+        let m = q.len() - 2;
+        let r0 = q[m] as usize;
+        let r1 = q[m + 1] as usize;
+        // a match is at least `m` bytes long
+        if at + m > end { return -1i64; }
+        let last = end - m;
+        let b = h.as_bytes();
+        let i = at;
+        loop {
+            let k = pair3(h, i, last + 1 - i, r0, q[r0], r1, q[r1]);
+            if k < 0i64 { return -1i64; }
+            let p = k as usize;
+            // matches start on char boundaries; offset 0 may be unchecked
+            let ok = (b[p] & 0xC0u8) != 0x80u8;
+            for j in 0..m {
+                if !ok { break; }
+                let bits = q[j];
+                if bits == 0u32 { continue; }
+                let x = b[p + j] as u32;
+                if x != (bits & 0xFFu32) && x != ((bits >> 8u32) & 0xFFu32) && x != (bits >> 16u32) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok { return k; }
+            i = p + 1;
+            if i > last { return -1i64; }
+        }
+    }
+}

@@ -1,0 +1,722 @@
+// Pattern text to `Hir`, by recursive descent. Errors carry the byte
+// offset of the offending token and say what to write instead.
+
+use pkg::RegexError;
+use pkg::class::{canon, difference, fold, fold_ascii, fold_char, intersect, negate, symmetric};
+use pkg::hir::{Hir, INF, LOOK_END_LINE, LOOK_END_TEXT, LOOK_NOT_WORD, LOOK_NOT_WORD_ASCII, LOOK_START_LINE, LOOK_START_TEXT, LOOK_WORD, LOOK_WORD_ASCII, LOOK_WORD_END, LOOK_WORD_END_ASCII, LOOK_WORD_START, LOOK_WORD_START_ASCII};
+
+/// Largest count of `{n}`, `{n,}` and `{n,m}`.
+const MAX_REPEAT: u32 = 100000u32;
+
+/// Deepest group and class nesting.
+const MAX_DEPTH: usize = 250;
+
+#[derive(Clone, Copy)]
+pub(pkg) struct Flags {
+    pub(pkg) i: bool;
+    pub(pkg) m: bool;
+    pub(pkg) s: bool;
+    pub(pkg) x: bool;
+    /// `U`: greedy and lazy swapped.
+    pub(pkg) swap: bool;
+    /// `u`: Unicode classes, `\b` and case folding (on by default).
+    pub(pkg) u: bool;
+}
+
+/// The parse result: the tree, the group count (group 0 included) and
+/// each group's name.
+pub(pkg) struct Parsed {
+    pub(pkg) hir: Hir;
+    pub(pkg) names: List<str | none>;
+}
+
+pub(pkg) const fn parse(pattern: str, flags: Flags) throws (RegexError) -> Parsed {
+    try parse_as(pattern, flags, false)
+}
+
+/// The syntax check of `parse`, for compile time: every error `parse`
+/// reports, but classes are not built (no Unicode tables, no case
+/// folding), so the tree is only a shape.
+pub(pkg) const fn check(pattern: str, flags: Flags) throws (RegexError) {
+    _ = try parse_as(pattern, flags, true);
+}
+
+const fn parse_as(pattern: str, flags: Flags, check: bool) throws (RegexError) -> Parsed {
+    let cs: List<char> = List::new();
+    let offs: List<usize> = List::new();
+    for (o, c) in pattern.char_indices() {
+        cs.push(c);
+        offs.push(o);
+    }
+    let p = Parser { pat: pattern, cs: cs, offs: offs, i: 0, f: flags, names: [none], seen: Dict::new(), depth: 0, check: check };
+    let h = try p.alt();
+    if p.i < p.cs.len() {
+        // alt() stops only at `)` here
+        throw p.err(p.i, "unopened group: this `)` has no `(`; remove it or write `\\)` to match a parenthesis");
+    }
+    Parsed { hir: h, names: p.names }
+}
+
+struct Parser {
+    pat: str;
+    cs: List<char>;
+    offs: List<usize>;
+    i: usize;
+    f: Flags;
+    names: List<str | none>;
+    seen: Dict<str, usize>;
+    depth: usize;
+    /// Syntax only (`check`).
+    check: bool;
+}
+
+const fn is_digit(c: char) -> bool { c >= '0' && c <= '9' }
+
+const fn lit(c: u32) -> Hir { Hir::Class([c, c]) }
+
+const fn ascii_word() -> List<u32> { [0x30u32, 0x39u32, 0x41u32, 0x5Au32, 0x5Fu32, 0x5Fu32, 0x61u32, 0x7Au32] }
+
+const fn ascii_space() -> List<u32> { [0x09u32, 0x0Du32, 0x20u32, 0x20u32] }
+
+const fn ascii_digit() -> List<u32> { [0x30u32, 0x39u32] }
+
+/// `[[:name:]]` classes (ASCII).
+const fn posix(name: str) -> List<u32> | none {
+    if name == "alnum" { return [0x30u32, 0x39u32, 0x41u32, 0x5Au32, 0x61u32, 0x7Au32]; }
+    if name == "alpha" { return [0x41u32, 0x5Au32, 0x61u32, 0x7Au32]; }
+    if name == "ascii" { return [0u32, 0x7Fu32]; }
+    if name == "blank" { return [0x09u32, 0x09u32, 0x20u32, 0x20u32]; }
+    if name == "cntrl" { return [0u32, 0x1Fu32, 0x7Fu32, 0x7Fu32]; }
+    if name == "digit" { return ascii_digit(); }
+    if name == "graph" { return [0x21u32, 0x7Eu32]; }
+    if name == "lower" { return [0x61u32, 0x7Au32]; }
+    if name == "print" { return [0x20u32, 0x7Eu32]; }
+    if name == "punct" { return [0x21u32, 0x2Fu32, 0x3Au32, 0x40u32, 0x5Bu32, 0x60u32, 0x7Bu32, 0x7Eu32]; }
+    if name == "space" { return ascii_space(); }
+    if name == "upper" { return [0x41u32, 0x5Au32]; }
+    if name == "word" { return ascii_word(); }
+    if name == "xdigit" { return [0x30u32, 0x39u32, 0x41u32, 0x46u32, 0x61u32, 0x66u32]; }
+    none
+}
+
+impl Parser {
+    const fn err(self, i: usize, msg: str) -> RegexError {
+        let at = if i < self.offs.len() { self.offs[i] } else { self.pat.len() };
+        RegexError::Syntax { pattern: self.pat, at: at, message: msg }
+    }
+
+    const fn eof(self) -> bool { self.i >= self.cs.len() }
+
+    const fn peek(self) -> char { if self.i < self.cs.len() { self.cs[self.i] } else { '\0' } }
+
+    const fn peek_at(self, k: usize) -> char { if self.i + k < self.cs.len() { self.cs[self.i + k] } else { '\0' } }
+
+    const fn looking_at(self, s: str) -> bool {
+        let k = 0usize;
+        for c in s.chars() {
+            if self.peek_at(k) != c { return false; }
+            k += 1;
+        }
+        true
+    }
+
+    /// Skips whitespace and `#` comments under `x`.
+    const fn trivia(ref self) {
+        if !self.f.x { return; }
+        while !self.eof() {
+            let c = self.peek();
+            if c.is_whitespace() {
+                self.i += 1;
+            } else if c == '#' {
+                while !self.eof() && self.peek() != '\n' { self.i += 1; }
+            } else {
+                break;
+            }
+        }
+    }
+
+    const fn alt(ref self) throws (RegexError) -> Hir {
+        let branches: List<Hir> = List::new();
+        loop {
+            branches.push(try self.concat());
+            if self.peek() == '|' && !self.eof() {
+                self.i += 1;
+                continue;
+            }
+            break;
+        }
+        if branches.len() == 1 { branches[0] } else { Hir::Alt(branches) }
+    }
+
+    const fn concat(ref self) throws (RegexError) -> Hir {
+        let items: List<Hir> = List::new();
+        loop {
+            self.trivia();
+            if self.eof() { break; }
+            let c = self.peek();
+            if c == '|' || c == ')' { break; }
+            let start = self.i;
+            if c == '*' || c == '+' || c == '?' || (c == '{' && self.counted_ahead()) {
+                throw self.err(start, f"repetition operator `{c}` has nothing to repeat; put it after an atom (`a{c}`) or write `\\{c}` to match it");
+            }
+            if c == '(' && self.looking_at("(?") && self.flag_group_ahead() {
+                // `(?flags)` changes the flags for the rest of the group
+                try self.flag_group();
+                continue;
+            }
+            let atom = try self.atom();
+            items.push(try self.repeat(atom, start));
+        }
+        if items.is_empty() { return Hir::Empty; }
+        if items.len() == 1 { items[0] } else { Hir::Concat(items) }
+    }
+
+    /// Whether a `{` at the cursor starts a well-formed count.
+    const fn counted_ahead(self) -> bool {
+        let k = 1usize;
+        let digits = 0;
+        while is_digit(self.peek_at(k)) {
+            k += 1;
+            digits += 1;
+        }
+        digits > 0 && (self.peek_at(k) == '}' || self.peek_at(k) == ',')
+    }
+
+    const fn repeat(ref self, atom: Hir, start: usize) throws (RegexError) -> Hir {
+        let h = atom;
+        let reps = 0;
+        loop {
+            self.trivia();
+            if self.eof() { return h; }
+            let at = self.i;
+            let c = self.peek();
+            let min = 0u32;
+            let max = INF;
+            if c == '*' {
+                self.i += 1;
+            } else if c == '+' {
+                min = 1u32;
+                self.i += 1;
+            } else if c == '?' {
+                max = 1u32;
+                self.i += 1;
+            } else if c == '{' {
+                (min, max) = try self.counted();
+            } else {
+                return h;
+            }
+            if reps > 0 {
+                if c == '+' {
+                    throw self.err(at, "possessive repetition is not supported: the engine never backtracks, so `a*+` means the same as `a*`; drop the `+`");
+                }
+                throw self.err(at, "nested repetition: wrap the inner one in a group, `(?:a*)*`, or drop one operator");
+            }
+            let greedy = true;
+            if self.peek() == '?' && !self.eof() {
+                greedy = false;
+                self.i += 1;
+            }
+            if self.f.swap { greedy = !greedy; }
+            h = Hir::Repeat { sub: [h], min: min, max: max, greedy: greedy };
+            reps += 1;
+            _ = start;
+        }
+    }
+
+    /// `{n}`, `{n,}` or `{n,m}` at the cursor.
+    const fn counted(ref self) throws (RegexError) -> (u32, u32) {
+        let open = self.i;
+        self.i += 1;
+        self.trivia();
+        let lo = try self.number(open);
+        self.trivia();
+        let hi = lo;
+        if self.peek() == ',' && !self.eof() {
+            self.i += 1;
+            self.trivia();
+            if self.peek() == '}' { hi = INF; } else { hi = try self.number(open); }
+            self.trivia();
+        }
+        if self.eof() || self.peek() != '}' {
+            throw self.err(open, "unclosed counted repetition: write `{n}`, `{n,}` or `{n,m}`, or `\\{` to match a brace");
+        }
+        self.i += 1;
+        if hi != INF && lo > hi {
+            throw self.err(open, f"invalid repetition `{{{lo},{hi}}}`: write the smaller count first, `{{{hi},{lo}}}`");
+        }
+        (lo, hi)
+    }
+
+    const fn number(ref self, open: usize) throws (RegexError) -> u32 {
+        let start = self.i;
+        let v = 0u64;
+        while is_digit(self.peek()) && !self.eof() {
+            v = v * 10u64 + ((self.peek() as u32) - 0x30u32) as u64;
+            if v > MAX_REPEAT as u64 {
+                throw self.err(start, f"repetition count is larger than {MAX_REPEAT}; use a smaller count, or `+` / `*` for no upper bound");
+            }
+            self.i += 1;
+        }
+        if self.i == start {
+            throw self.err(open, "unclosed counted repetition: write `{n}`, `{n,}` or `{n,m}` with decimal counts, or `\\{` to match a brace");
+        }
+        v as u32
+    }
+
+    const fn atom(ref self) throws (RegexError) -> Hir {
+        let c = self.peek();
+        if c == '(' { return try self.group(); }
+        if c == '[' { return Hir::Class(try self.class()); }
+        if c == '\\' { return try self.escape(); }
+        self.i += 1;
+        if c == '.' {
+            return if self.f.s { Hir::Class([0u32, 0x10FFFFu32]) } else { Hir::Class([0u32, 9u32, 11u32, 0x10FFFFu32]) };
+        }
+        if c == '^' { return Hir::Look(if self.f.m { LOOK_START_LINE } else { LOOK_START_TEXT }); }
+        if c == '$' { return Hir::Look(if self.f.m { LOOK_END_LINE } else { LOOK_END_TEXT }); }
+        self.literal(c as u32)
+    }
+
+    const fn literal(self, c: u32) -> Hir {
+        if self.f.i && !self.check { return Hir::Class(if self.f.u { fold_char(c) } else { fold_ascii([c, c]) }); }
+        lit(c)
+    }
+
+    /// Class `r` under the current flags (case folding).
+    const fn folded(self, r: List<u32>) -> List<u32> {
+        if !self.f.i || self.check { return r; }
+        if self.f.u { fold(r) } else { fold_ascii(r) }
+    }
+
+    /// Whether `(?` at the cursor is a bare flag group `(?flags)`.
+    const fn flag_group_ahead(self) -> bool {
+        let k = 2usize;
+        while self.i + k < self.cs.len() {
+            let c = self.cs[self.i + k];
+            if c == ')' { return k > 2; }
+            if c == ':' { return false; }
+            if !"imsxUu-".contains(f"{c}") { return false; }
+            k += 1;
+        }
+        false
+    }
+
+    const fn flag_group(ref self) throws (RegexError) {
+        self.i += 2;
+        let f = try self.flags();
+        self.i += 1;
+        self.f = f;
+    }
+
+    /// Flags at the cursor up to `)` or `:` (not consumed).
+    const fn flags(ref self) throws (RegexError) -> Flags {
+        let f = self.f;
+        let on = true;
+        let neg_at: usize | none = none;
+        let seen = "";
+        let any_after_neg = false;
+        while !self.eof() {
+            let c = self.peek();
+            if c == ')' || c == ':' { break; }
+            if c == '-' {
+                if neg_at != none { throw self.err(self.i, "repeated `-` in flags: write each flag to turn off after a single `-`, `(?i-sm)`"); }
+                neg_at = self.i;
+                on = false;
+                self.i += 1;
+                continue;
+            }
+            let s = f"{c}";
+            if seen.contains(s) { throw self.err(self.i, f"duplicate flag `{c}`: write it once"); }
+            seen = seen + s;
+            if c == 'i' {
+                f.i = on;
+            } else if c == 'm' {
+                f.m = on;
+            } else if c == 's' {
+                f.s = on;
+            } else if c == 'x' {
+                f.x = on;
+            } else if c == 'U' {
+                f.swap = on;
+            } else if c == 'u' {
+                f.u = on;
+            } else {
+                throw self.err(self.i, f"unknown flag `{c}`: the flags are `i` (case-insensitive), `m` (multi-line), `s` (`.` matches `\\n`), `x` (verbose), `U` (swap greedy) and `u` (Unicode)");
+            }
+            if !on { any_after_neg = true; }
+            self.i += 1;
+        }
+        if self.eof() {
+            throw self.err(self.i, "unclosed flag group: end it with `)`, or with `:` for a scoped group, `(?i:abc)`");
+        }
+        if let at: usize = neg_at {
+            if !any_after_neg { throw self.err(at, "`-` without a flag after it: name the flags to turn off, `(?-i)`"); }
+        }
+        f
+    }
+
+    const fn group(ref self) throws (RegexError) -> Hir {
+        let open = self.i;
+        self.depth += 1;
+        if self.depth > MAX_DEPTH { throw self.err(open, f"groups nest deeper than {MAX_DEPTH}; flatten the pattern"); }
+        self.i += 1;
+        let saved = self.f;
+        let index: u32 | none = none;
+        if self.peek() == '?' && !self.eof() {
+            let q = self.i;
+            self.i += 1;
+            let c = self.peek();
+            if c == ':' {
+                self.i += 1;
+            } else if self.looking_at("P<") || (c == '<' && self.peek_at(1) != '=' && self.peek_at(1) != '!') {
+                self.i += if c == 'P' { 2 } else { 1 };
+                index = try self.group_name(q);
+            } else if c == '=' || c == '!' {
+                throw self.err(open, "look-ahead `(?=...)` / `(?!...)` is not supported: it would need backtracking; match the longer text and check it in code, or use a second regex");
+            } else if self.looking_at("<=") || self.looking_at("<!") {
+                throw self.err(open, "look-behind `(?<=...)` / `(?<!...)` is not supported: it would need backtracking; capture the preceding text in a group and check it in code");
+            } else if self.looking_at("P=") {
+                throw self.err(open, "backreferences are not supported: they make matching exponential in the worst case; capture the group and compare the text in code");
+            } else if self.looking_at("P>") || c == 'R' || is_digit(c) {
+                throw self.err(open, "recursion is not supported: a regular expression cannot match nested structure; use a parser");
+            } else if c == '>' {
+                throw self.err(open, "atomic groups are not supported: the engine never backtracks, so `(?>a)` means `(?:a)`; write `(?:...)`");
+            } else if c == '#' {
+                throw self.err(open, "comment groups are not supported: use the `x` flag and `#` comments, `(?x) a # comment`");
+            } else {
+                self.f = try self.flags();
+                if self.peek() == ')' {
+                    // handled by flag_group_ahead in concat; here only `(?)`
+                    throw self.err(q, "empty flag group: write flags, `(?i)`, or drop it");
+                }
+                self.i += 1;
+            }
+        } else {
+            index = self.names.len() as u32;
+            self.names.push(none);
+        }
+        let inner = try self.alt();
+        if self.eof() || self.peek() != ')' {
+            throw self.err(open, "unclosed group: add `)`, or write `\\(` to match a parenthesis");
+        }
+        self.i += 1;
+        self.f = saved;
+        self.depth -= 1;
+        if let n: u32 = index { return Hir::Group { sub: [inner], index: n }; }
+        inner
+    }
+
+    /// `name>` at the cursor; registers the group.
+    const fn group_name(ref self, q: usize) throws (RegexError) -> u32 {
+        let start = self.i;
+        let b = StrBuf::new();
+        while !self.eof() && self.peek() != '>' {
+            let c = self.peek();
+            let ok = c == '_' || c.is_ascii_alphabetic() || (b.len() > 0 && (c.is_ascii_digit() || c == '.' || c == '[' || c == ']'));
+            if !ok {
+                throw self.err(self.i, f"invalid character `{c}` in group name: a name starts with a letter or `_`, then letters, digits, `_`, `.`, `[` or `]`");
+            }
+            b.push(c);
+            self.i += 1;
+        }
+        if self.eof() { throw self.err(q, "unclosed group name: end it with `>`, `(?<name>...)`"); }
+        let name = b.to_str();
+        if name.is_empty() { throw self.err(start, "empty group name: write one, `(?<year>...)`, or use `(?:...)` for a group without a name"); }
+        self.i += 1;
+        if self.seen.contains_key(name) {
+            throw self.err(start, f"duplicate group name `{name}`: give each named group its own name");
+        }
+        let n = self.names.len();
+        self.seen.insert(name, n);
+        self.names.push(name);
+        n as u32
+    }
+
+    const fn escape(ref self) throws (RegexError) -> Hir {
+        let at = self.i;
+        self.i += 1;
+        if self.eof() { throw self.err(at, "trailing `\\`: escape it as `\\\\` to match a backslash"); }
+        let c = self.peek();
+        if c == 'A' {
+            self.i += 1;
+            return Hir::Look(LOOK_START_TEXT);
+        }
+        if c == 'z' {
+            self.i += 1;
+            return Hir::Look(LOOK_END_TEXT);
+        }
+        if c == 'Z' {
+            throw self.err(at, "`\\Z` is not supported: write `\\z` for the end of the text, or `\\n?\\z` to allow a final newline");
+        }
+        if c == 'b' {
+            self.i += 1;
+            if self.peek() == '{' && !self.eof() {
+                if self.looking_at("{start}") {
+                    self.i += 7;
+                    return Hir::Look(if self.f.u { LOOK_WORD_START } else { LOOK_WORD_START_ASCII });
+                }
+                if self.looking_at("{end}") {
+                    self.i += 5;
+                    return Hir::Look(if self.f.u { LOOK_WORD_END } else { LOOK_WORD_END_ASCII });
+                }
+                if !self.counted_ahead() {
+                    throw self.err(at, "unknown word boundary: write `\\b`, `\\b{start}` or `\\b{end}`");
+                }
+            }
+            return Hir::Look(if self.f.u { LOOK_WORD } else { LOOK_WORD_ASCII });
+        }
+        if c == 'B' {
+            self.i += 1;
+            return Hir::Look(if self.f.u { LOOK_NOT_WORD } else { LOOK_NOT_WORD_ASCII });
+        }
+        if c == '<' {
+            self.i += 1;
+            return Hir::Look(if self.f.u { LOOK_WORD_START } else { LOOK_WORD_START_ASCII });
+        }
+        if c == '>' {
+            self.i += 1;
+            return Hir::Look(if self.f.u { LOOK_WORD_END } else { LOOK_WORD_END_ASCII });
+        }
+        if let r: List<u32> = try self.class_escape(at) { return Hir::Class(self.folded(r)); }
+        let v = try self.char_escape(at);
+        self.literal(v)
+    }
+
+    /// `\d \w \s \p{..}` and their negations at the cursor (after `\`),
+    /// or `none` for other escapes (nothing consumed).
+    const fn class_escape(ref self, at: usize) throws (RegexError) -> List<u32> | none {
+        let c = self.peek();
+        let lower = c.to_ascii_lowercase();
+        if lower == 'd' || lower == 'w' || lower == 's' {
+            self.i += 1;
+            let u = self.f.u && !self.check;
+            let r = if lower == 'd' {
+                if u { pkg::unicode::digit() } else { ascii_digit() }
+            } else if lower == 'w' {
+                if u { pkg::unicode::word() } else { ascii_word() }
+            } else {
+                if u { pkg::unicode::space() } else { ascii_space() }
+            };
+            return if c.is_ascii_uppercase() { negate(r) } else { r };
+        }
+        if c == 'p' || c == 'P' {
+            self.i += 1;
+            let name = "";
+            let neg = c == 'P';
+            if self.peek() == '{' && !self.eof() {
+                let open = self.i;
+                self.i += 1;
+                let b = StrBuf::new();
+                while !self.eof() && self.peek() != '}' {
+                    b.push(self.peek());
+                    self.i += 1;
+                }
+                if self.eof() { throw self.err(open, "unclosed Unicode class: end it with `}`, `\\p{Greek}`"); }
+                self.i += 1;
+                name = b.to_str();
+                if name.starts_with("^") {
+                    neg = !neg;
+                    name = name[1:];
+                }
+            } else if self.eof() {
+                throw self.err(at, "`\\p` needs a class: write `\\pL` or `\\p{Greek}`");
+            } else {
+                name = f"{self.peek()}";
+                self.i += 1;
+            }
+            let r = (if self.check { pkg::unicode::known(name) } else { pkg::unicode::property(name) }) ?? {
+                throw self.err(at, f"unknown Unicode class `{name}`: use a general category (`L`, `Lu`, `Letter`, `Nd`), a script (`Greek`, `Hangul`), `sc=..` / `gc=..`, or a property such as `Alphabetic` or `White_Space`");
+            };
+            return if neg { negate(r) } else { r };
+        }
+        none
+    }
+
+    /// A one-character escape at the cursor (after `\`).
+    const fn char_escape(ref self, at: usize) throws (RegexError) -> u32 {
+        let c = self.peek();
+        self.i += 1;
+        if c == 'n' { return 0x0Au32; }
+        if c == 't' { return 0x09u32; }
+        if c == 'r' { return 0x0Du32; }
+        if c == 'f' { return 0x0Cu32; }
+        if c == 'v' { return 0x0Bu32; }
+        if c == 'a' { return 0x07u32; }
+        if c == 'x' { return try self.hex(at, 2); }
+        if c == 'u' { return try self.hex(at, 4); }
+        if c == 'U' { return try self.hex(at, 8); }
+        if c >= '1' && c <= '9' || c == 'k' || c == 'g' {
+            throw self.err(at, "backreferences are not supported: they make matching exponential in the worst case; capture the group and compare the text in code");
+        }
+        if c == '0' { throw self.err(at, "octal escapes are not supported: write `\\x00` (or `\\x{..}` for any code point)"); }
+        if c == 'Q' || c == 'E' { throw self.err(at, "`\\Q...\\E` is not supported: build the pattern with `regex::escape(text)`"); }
+        if c.is_ascii() && !c.is_ascii_alphanumeric() { return c as u32; }
+        if c.is_ascii_alphanumeric() {
+            throw self.err(at, f"unknown escape `\\{c}`: write `{c}` to match the letter, or `\\\\{c}` to match a backslash and `{c}`");
+        }
+        throw self.err(at, f"unknown escape `\\{c}`: write `{c}` without the backslash");
+    }
+
+    /// `\xHH`, `\uHHHH`, `\UHHHHHHHH` or the `{..}` form, after the
+    /// letter.
+    const fn hex(ref self, at: usize, width: usize) throws (RegexError) -> u32 {
+        let v = 0u32;
+        let digits = 0usize;
+        let braced = self.peek() == '{' && !self.eof();
+        if braced { self.i += 1; }
+        while !self.eof() {
+            let c = self.peek();
+            if braced && c == '}' { break; }
+            if !braced && digits == width { break; }
+            let d = c.to_digit(16) ?? {
+                if braced {
+                    throw self.err(self.i, f"invalid hex digit `{c}` in `\\x{{..}}`: use 0-9 and a-f");
+                }
+                break;
+            };
+            if digits >= 8 { throw self.err(at, "code point escape has too many digits: at most `\\x{10FFFF}`"); }
+            v = v * 16u32 + d;
+            digits += 1;
+            self.i += 1;
+        }
+        if braced {
+            if self.eof() { throw self.err(at, "unclosed `\\x{..}`: end it with `}`"); }
+            self.i += 1;
+            if digits == 0 { throw self.err(at, "empty `\\x{}`: write the code point in hex, `\\x{263A}`"); }
+        } else if digits != width {
+            throw self.err(at, f"escape needs exactly {width} hex digits, or braces: `\\x{{..}}`");
+        }
+        if v > 0x10FFFFu32 || (v >= 0xD800u32 && v <= 0xDFFFu32) {
+            throw self.err(at, f"`\\x{{{v:x}}}` is not a Unicode scalar value: use 0 to 10FFFF, without the surrogates D800-DFFF");
+        }
+        v
+    }
+
+    /// `[...]` at the cursor.
+    const fn class(ref self) throws (RegexError) -> List<u32> {
+        let open = self.i;
+        self.depth += 1;
+        if self.depth > MAX_DEPTH { throw self.err(open, f"classes nest deeper than {MAX_DEPTH}; flatten the pattern"); }
+        self.i += 1;
+        let neg = false;
+        if self.peek() == '^' && !self.eof() {
+            neg = true;
+            self.i += 1;
+        }
+        let acc = try self.class_union(open, true);
+        loop {
+            self.class_trivia();
+            if self.eof() { throw self.err(open, "unclosed class: add `]`, or write `\\[` to match a bracket"); }
+            if self.peek() == ']' {
+                self.i += 1;
+                break;
+            }
+            let op = self.peek();
+            self.i += 2;
+            let rhs = try self.class_union(open, false);
+            acc = if op == '&' { intersect(acc, rhs) } else if op == '-' { difference(acc, rhs) } else { symmetric(acc, rhs) };
+        }
+        self.depth -= 1;
+        if neg { negate(acc) } else { acc }
+    }
+
+    const fn class_trivia(ref self) {
+        if !self.f.x { return; }
+        while !self.eof() && self.peek().is_whitespace() { self.i += 1; }
+    }
+
+    const fn set_op_ahead(self) -> bool { self.looking_at("&&") || self.looking_at("--") || self.looking_at("~~") }
+
+    /// Items up to `]` or a set operator. `first`: a leading `]` is a
+    /// literal.
+    const fn class_union(ref self, open: usize, first: bool) throws (RegexError) -> List<u32> {
+        let acc: List<u32> = List::new();
+        let n = 0;
+        loop {
+            self.class_trivia();
+            if self.eof() { throw self.err(open, "unclosed class: add `]`, or write `\\[` to match a bracket"); }
+            let c = self.peek();
+            if c == ']' && !(first && n == 0) { break; }
+            if self.set_op_ahead() && n > 0 { break; }
+            if c == '[' {
+                if self.peek_at(1) == ':' {
+                    if let r: List<u32> = try self.posix_class() {
+                        acc.extend(self.folded(r));
+                        n += 1;
+                        continue;
+                    }
+                }
+                acc.extend(try self.class());
+                n += 1;
+                continue;
+            }
+            let item_at = self.i;
+            let lo = try self.class_char(open);
+            let lo_v = match lo {
+                r: List<u32> => {
+                    acc.extend(r);
+                    n += 1;
+                    continue;
+                }
+                v: u32 => v,
+            };
+            self.class_trivia();
+            if self.peek() == '-' && self.peek_at(1) != ']' && !self.looking_at("--") && self.i + 1 < self.cs.len() {
+                self.i += 1;
+                self.class_trivia();
+                let hi = try self.class_char(open);
+                let hi_v = match hi {
+                    _: List<u32> => throw self.err(item_at, "a class like `\\d` cannot end a range: write it outside the range, `[a-z\\d]`"),
+                    v: u32 => v,
+                };
+                if lo_v > hi_v {
+                    throw self.err(item_at, "invalid class range: write the smaller end first, `[a-z]`");
+                }
+                acc.extend(self.folded([lo_v, hi_v]));
+            } else {
+                acc.extend(self.folded([lo_v, lo_v]));
+            }
+            n += 1;
+        }
+        canon(acc)
+    }
+
+    /// One class member: a character, or a class escape.
+    const fn class_char(ref self, open: usize) throws (RegexError) -> u32 | List<u32> {
+        let c = self.peek();
+        if c == '\\' {
+            let at = self.i;
+            self.i += 1;
+            if self.eof() { throw self.err(open, "unclosed class: add `]`, or write `\\[` to match a bracket"); }
+            if let r: List<u32> = try self.class_escape(at) { return r; }
+            let e = self.peek();
+            if e == 'b' {
+                self.i += 1;
+                return 0x08u32;
+            }
+            return try self.char_escape(at);
+        }
+        self.i += 1;
+        c as u32
+    }
+
+    /// `[:name:]` or `[:^name:]` at the cursor, or `none` (nothing
+    /// consumed) when it is not one.
+    const fn posix_class(ref self) throws (RegexError) -> List<u32> | none {
+        let k = 2usize;
+        let neg = self.peek_at(2) == '^';
+        if neg { k = 3; }
+        let b = StrBuf::new();
+        while self.peek_at(k).is_ascii_lowercase() {
+            b.push(self.peek_at(k));
+            k += 1;
+        }
+        if self.peek_at(k) != ':' || self.peek_at(k + 1) != ']' { return none; }
+        let name = b.to_str();
+        let r = posix(name) ?? {
+            throw self.err(self.i, f"unknown POSIX class `[:{name}:]`: use alnum, alpha, ascii, blank, cntrl, digit, graph, lower, print, punct, space, upper, word or xdigit");
+        };
+        self.i += k + 2;
+        if neg { negate(r) } else { r }
+    }
+}

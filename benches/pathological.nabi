@@ -1,0 +1,33 @@
+// Patterns that are exponential for a backtracking engine, on 100 KB
+// of `a`. Bytes are haystack bytes.
+
+use pkg::Regex;
+use core::bench::Bench;
+use core::hint::black_box;
+
+fn run(b: Bench, pattern: str, groups: bool) {
+    let h = "a".repeat(100000);
+    let re = try! Regex::new(pattern);
+    b.set_bytes(h.len() as i64);
+    if groups {
+        b.iter(|| re.captures(black_box(h)));
+    } else {
+        b.iter(|| re.find(black_box(h)));
+    }
+}
+
+/// `(a*)*b`, no match, on the DFA.
+#[bench]
+fn nested_star(b: Bench) { run(b, "(a*)*b", false); }
+
+/// `(a|aa)*c`, no match, on the DFA.
+#[bench]
+fn alt_star(b: Bench) { run(b, "(a|aa)*c", false); }
+
+/// `(a*)*$` with groups: one full-length match on the PikeVM.
+#[bench]
+fn nested_star_groups(b: Bench) { run(b, "(a*)*$", true); }
+
+/// `(?:a?){30}a{30}`, the classic: matches at the start.
+#[bench]
+fn optional_run(b: Bench) { run(b, "(?:a?){30}a{30}$", false); }

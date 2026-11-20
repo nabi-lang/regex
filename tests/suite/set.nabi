@@ -1,0 +1,30 @@
+// RegexSet.
+
+use pkg::RegexSet;
+
+#[test]
+fn matches() {
+    let set = try! RegexSet::new([r"\w+", r"\d+", r"\pN", r"^foo", r"bar$", "zzz"]);
+    let m = set.matches("foo 123 bar");
+    assert(m.iter() == [0, 1, 2, 3, 4]);
+    assert(m.matched(1) && !m.matched(5) && !m.matched(99));
+    assert(m.matched_any() && m.len() == 6);
+    assert(set.is_match("zzz") && set.len() == 6);
+    assert(set.matches("").iter() == []);
+    assert(set.patterns()[3] == "^foo");
+}
+
+#[test]
+fn overlapping_and_empty() {
+    let set = try! RegexSet::new(["a", "ab", "abc", ""]);
+    assert(set.matches("abc").iter() == [0, 1, 2, 3]);
+    assert(set.matches("x").iter() == [3]);
+    let none_set = try! RegexSet::new([]);
+    assert(!none_set.is_match("abc") && none_set.matches("abc").iter() == []);
+}
+
+#[test]
+fn errors() {
+    let e = try { _ = try RegexSet::new(["ok", "a{2,1}"]); "" } catch e: pkg::RegexError { f"{e}" };
+    assert(e.contains("smaller count first"));
+}

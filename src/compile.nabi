@@ -1,0 +1,392 @@
+// `Hir` to a byte-level Thompson NFA. Classes become UTF-8 byte range
+// sequences joined in a prefix trie. The reverse program (for finding
+// where a match starts) reads the same language backwards.
+
+use pkg::RegexError;
+use pkg::hir::{Hir, INF};
+use pkg::prog::{OP_FAIL, OP_LOOK, OP_MATCH, OP_NOP, OP_RANGES, OP_SAVE, OP_SPLIT, Prog};
+
+/// Bytes counted per instruction and per transition against the size
+/// limit.
+const INST_BYTES: usize = 16;
+const TRANS_BYTES: usize = 12;
+
+struct Frag {
+    start: i32;
+    /// A NOP whose `next` is still open.
+    end: i32;
+}
+
+struct Compiler {
+    p: Prog;
+    reverse: bool;
+    caps: bool;
+    limit: usize;
+}
+
+fn new_prog() -> Prog {
+    Prog {
+        op: List::new(), a: List::new(), b: List::new(), next: List::new(), tlo: List::new(), thi: List::new(), tnext: List::new(),
+        meta: [0i64, 0i64, 0i64, 0i64, 0i64],
+    }
+}
+
+/// Compiles the patterns of `hirs` (one, or a set) into one program.
+/// `reverse`: reads backwards, for start positions. `caps`: emit
+/// capture slots.
+pub(pkg) fn compile(hirs: List<Hir>, groups: usize, reverse: bool, caps: bool, limit: usize) throws (RegexError) -> Prog {
+    let c = Compiler { p: new_prog(), reverse: reverse, caps: caps, limit: limit };
+    let p = c.p;
+    let starts: List<i32> = List::new();
+    for k in 0..hirs.len() {
+        let h = hirs[k];
+        p.meta[3] = p.meta[3] | pkg::hir::looks(h) as i64;
+        let f = try c.emit(h);
+        let s = f.start;
+        if caps {
+            let open = try c.inst(OP_SAVE, 0, 0);
+            let close = try c.inst(OP_SAVE, 1, 0);
+            p.next[open as usize] = f.start;
+            c.patch(f.end, close);
+            s = open;
+            let m = try c.inst(OP_MATCH, k as i32, 0);
+            p.next[close as usize] = m;
+        } else {
+            let m = try c.inst(OP_MATCH, k as i32, 0);
+            c.patch(f.end, m);
+        }
+        starts.push(s);
+    }
+    // one start: the first pattern's, or a split over all of them
+    let start = starts[0];
+    if starts.len() > 1 {
+        start = try c.alts(starts);
+    }
+    // unanchored: (?s:.)*? then the start
+    let any = try c.emit(Hir::Class([0u32, 0x10FFFFu32]));
+    let loop_ = try c.inst(OP_SPLIT, 0, 0);
+    p.next[loop_ as usize] = start;
+    p.b[loop_ as usize] = any.start;
+    c.patch(any.end, loop_);
+    c.strip();
+    p.meta[0] = resolve(p, start) as i64;
+    p.meta[1] = resolve(p, loop_) as i64;
+    p.meta[2] = if caps { 2 * groups as i64 } else { 0i64 };
+    p.meta[4] = hirs.len() as i64;
+    p
+}
+
+impl Compiler {
+    fn inst(self, op: i32, a: i32, b: i32) throws (RegexError) -> i32 {
+        let p = self.p;
+        let id = p.op.len() as i32;
+        p.op.push(op);
+        p.a.push(a);
+        p.b.push(b);
+        p.next.push(-1);
+        if p.op.len() * INST_BYTES + p.tlo.len() * TRANS_BYTES > self.limit {
+            throw RegexError::TooBig { limit: self.limit };
+        }
+        id
+    }
+
+    fn nop(self) throws (RegexError) -> i32 { try self.inst(OP_NOP, 0, 0) }
+
+    fn patch(self, nop: i32, to: i32) { self.p.next[nop as usize] = to; }
+
+    /// A split chain over `targets`, first preferred.
+    fn alts(self, targets: List<i32>) throws (RegexError) -> i32 {
+        let n = targets.len();
+        let cur = targets[n - 1];
+        let k = n - 1;
+        while k > 0 {
+            k -= 1;
+            let s = try self.inst(OP_SPLIT, 0, cur);
+            self.p.next[s as usize] = targets[k];
+            cur = s;
+        }
+        cur
+    }
+
+    fn emit(self, h: Hir) throws (RegexError) -> Frag {
+        match h {
+            Hir::Empty => {
+                let n = try self.nop();
+                Frag { start: n, end: n }
+            }
+            Hir::Class(r) => try self.class(r),
+            Hir::Look(k) => {
+                let kind = if self.reverse && k < 8 { k ^ 1 } else { k };
+                let l = try self.inst(OP_LOOK, kind, 0);
+                let e = try self.nop();
+                self.p.next[l as usize] = e;
+                Frag { start: l, end: e }
+            }
+            Hir::Group { sub, index } => {
+                if !self.caps { return try self.emit(sub[0]); }
+                let f = try self.emit(sub[0]);
+                let slot = 2 * (index as i32);
+                let open = try self.inst(OP_SAVE, if self.reverse { slot + 1 } else { slot }, 0);
+                let close = try self.inst(OP_SAVE, if self.reverse { slot } else { slot + 1 }, 0);
+                let e = try self.nop();
+                self.p.next[open as usize] = f.start;
+                self.patch(f.end, close);
+                self.p.next[close as usize] = e;
+                Frag { start: open, end: e }
+            }
+            Hir::Concat(xs) => {
+                let n = xs.len();
+                let first = try self.emit(xs[if self.reverse { n - 1 } else { 0 }]);
+                let end = first.end;
+                for k in 1..n {
+                    let f = try self.emit(xs[if self.reverse { n - 1 - k } else { k }]);
+                    self.patch(end, f.start);
+                    end = f.end;
+                }
+                Frag { start: first.start, end: end }
+            }
+            Hir::Alt(xs) => {
+                let e = try self.nop();
+                let starts: List<i32> = List::new();
+                for x in xs {
+                    let f = try self.emit(x);
+                    self.patch(f.end, e);
+                    starts.push(f.start);
+                }
+                Frag { start: try self.alts(starts), end: e }
+            }
+            Hir::Repeat { sub, min, max, greedy } => try self.repeat(sub[0], min, max, greedy),
+        }
+    }
+
+    fn repeat(self, sub: Hir, min: u32, max: u32, greedy: bool) throws (RegexError) -> Frag {
+        let start = try self.nop();
+        let end = start;
+        let k = 0u32;
+        // the required copies; with no upper bound the last one loops
+        let fixed = if max == INF && min > 0u32 { min - 1u32 } else { min };
+        while k < fixed {
+            let f = try self.emit(sub);
+            self.patch(end, f.start);
+            end = f.end;
+            k += 1u32;
+        }
+        if max == INF {
+            if min > 0u32 {
+                // x+: x then back
+                let f = try self.emit(sub);
+                self.patch(end, f.start);
+                let s = try self.inst(OP_SPLIT, 0, 0);
+                let e = try self.nop();
+                self.patch(f.end, s);
+                self.split_to(s, f.start, e, greedy);
+                return Frag { start: start, end: e };
+            }
+            if pkg::hir::nullable(sub) {
+                // x* as (x+)?: a plain loop would let the empty pass
+                // through x lose to skipping it, so groups in x would not
+                // take part
+                let f = try self.emit(sub);
+                let q = try self.inst(OP_SPLIT, 0, 0);
+                let plus = try self.inst(OP_SPLIT, 0, 0);
+                let e = try self.nop();
+                self.patch(end, q);
+                self.patch(f.end, plus);
+                self.split_to(q, f.start, e, greedy);
+                self.split_to(plus, f.start, e, greedy);
+                return Frag { start: start, end: e };
+            }
+            // x*
+            let s = try self.inst(OP_SPLIT, 0, 0);
+            let f = try self.emit(sub);
+            let e = try self.nop();
+            self.patch(end, s);
+            self.patch(f.end, s);
+            self.split_to(s, f.start, e, greedy);
+            return Frag { start: start, end: e };
+        }
+        // up to max - min optional copies, nested: (x(x)?)?
+        let e = try self.nop();
+        let n = max - min;
+        k = 0u32;
+        while k < n {
+            let s = try self.inst(OP_SPLIT, 0, 0);
+            let f = try self.emit(sub);
+            self.patch(end, s);
+            self.split_to(s, f.start, e, greedy);
+            end = f.end;
+            k += 1u32;
+        }
+        self.patch(end, e);
+        Frag { start: start, end: e }
+    }
+
+    fn split_to(self, s: i32, body: i32, out: i32, greedy: bool) {
+        let p = self.p;
+        if greedy {
+            p.next[s as usize] = body;
+            p.b[s as usize] = out;
+        } else {
+            p.next[s as usize] = out;
+            p.b[s as usize] = body;
+        }
+    }
+
+    fn class(self, r: List<u32>) throws (RegexError) -> Frag {
+        let e = try self.nop();
+        if r.is_empty() {
+            let f = try self.inst(OP_FAIL, 0, 0);
+            return Frag { start: f, end: e };
+        }
+        let seqs: List<List<i32>> = List::new();
+        let i = 0usize;
+        while i < r.len() {
+            utf8_seqs(r[i], r[i + 1], seqs);
+            i += 2;
+        }
+        if self.reverse {
+            for s in seqs { reverse_pairs(s); }
+            seqs.sort_by(|x, y| cmp_seq(x, y));
+        }
+        let start = try self.trie(seqs, 0, seqs.len(), 0, e);
+        Frag { start: start, end: e }
+    }
+
+    /// Instructions for `seqs[lo..hi]`, which share their first `depth`
+    /// ranges; finished sequences go to `end`.
+    fn trie(self, seqs: List<List<i32>>, lo: usize, hi: usize, depth: usize, end: i32) throws (RegexError) -> i32 {
+        // groups of identical range at `depth`
+        let glo: List<i32> = List::new();
+        let ghi: List<i32> = List::new();
+        let gnext: List<i32> = List::new();
+        let k = lo;
+        while k < hi {
+            let a = seqs[k][2 * depth];
+            let b = seqs[k][2 * depth + 1];
+            let j = k + 1;
+            while j < hi && seqs[j][2 * depth] == a && seqs[j][2 * depth + 1] == b { j += 1; }
+            let target = if seqs[k].len() == 2 * (depth + 1) { end } else { try self.trie(seqs, k, j, depth + 1, end) };
+            glo.push(a);
+            ghi.push(b);
+            gnext.push(target);
+            k = j;
+        }
+        let disjoint = true;
+        for g in 1..glo.len() {
+            if glo[g] <= ghi[g - 1] { disjoint = false; }
+        }
+        if disjoint { return try self.ranges(glo, ghi, gnext, 0, glo.len()); }
+        let alts: List<i32> = List::new();
+        for g in 0..glo.len() { alts.push(try self.ranges(glo, ghi, gnext, g, g + 1)); }
+        try self.alts(alts)
+    }
+
+    fn ranges(self, lo: List<i32>, hi: List<i32>, next: List<i32>, from: usize, to: usize) throws (RegexError) -> i32 {
+        let p = self.p;
+        let at = p.tlo.len() as i32;
+        for g in from..to {
+            p.tlo.push(lo[g]);
+            p.thi.push(hi[g]);
+            p.tnext.push(next[g]);
+        }
+        try self.inst(OP_RANGES, at, (to - from) as i32)
+    }
+
+    /// Replaces every reference to a NOP by where the NOP chain leads.
+    fn strip(self) {
+        let p = self.p;
+        let n = p.op.len();
+        for pc in 0..n {
+            let o = p.op[pc];
+            if o == OP_SPLIT || o == OP_SAVE || o == OP_LOOK || o == OP_NOP {
+                p.next[pc] = resolve(p, p.next[pc]);
+            }
+            if o == OP_SPLIT { p.b[pc] = resolve(p, p.b[pc]); }
+        }
+        for t in 0..p.tnext.len() { p.tnext[t] = resolve(p, p.tnext[t]); }
+    }
+}
+
+fn resolve(p: Prog, pc: i32) -> i32 {
+    let x = pc;
+    while x >= 0 && p.op[x as usize] == OP_NOP { x = p.next[x as usize]; }
+    x
+}
+
+fn reverse_pairs(s: List<i32>) {
+    let n = s.len() / 2;
+    for k in 0..n / 2 {
+        let j = n - 1 - k;
+        let a = s[2 * k];
+        let b = s[2 * k + 1];
+        s[2 * k] = s[2 * j];
+        s[2 * k + 1] = s[2 * j + 1];
+        s[2 * j] = a;
+        s[2 * j + 1] = b;
+    }
+}
+
+fn cmp_seq(x: List<i32>, y: List<i32>) -> Ordering {
+    let n = if x.len() < y.len() { x.len() } else { y.len() };
+    for k in 0..n {
+        if x[k] != y[k] { return x[k].cmp(y[k]); }
+    }
+    x.len().cmp(y.len())
+}
+
+/// The UTF-8 byte range sequences of code points `lo..=hi` (surrogates
+/// skipped), ascending, each as flattened `(lo, hi)` byte pairs.
+fn utf8_seqs(lo: u32, hi: u32, out: List<List<i32>>) {
+    if lo > hi { return; }
+    if lo <= 0xDFFFu32 && hi >= 0xD800u32 {
+        if lo < 0xD800u32 { utf8_seqs(lo, 0xD7FFu32, out); }
+        if hi > 0xDFFFu32 { utf8_seqs(0xE000u32, hi, out); }
+        return;
+    }
+    // split where the encoded length changes
+    let bounds: [u32; 3] = [0x7Fu32, 0x7FFu32, 0xFFFFu32];
+    for m in bounds {
+        if lo <= m && m < hi {
+            utf8_seqs(lo, m, out);
+            utf8_seqs(m + 1u32, hi, out);
+            return;
+        }
+    }
+    if hi < 0x80u32 {
+        out.push([lo as i32, hi as i32]);
+        return;
+    }
+    // split until every continuation position spans a full or aligned range
+    for i in 1..4 {
+        let m = (1u32 << (6 * i) as u32) - 1u32;
+        if (lo & !m) != (hi & !m) {
+            if (lo & m) != 0u32 {
+                utf8_seqs(lo, lo | m, out);
+                utf8_seqs((lo | m) + 1u32, hi, out);
+                return;
+            }
+            if (hi & m) != m {
+                utf8_seqs(lo, (hi & !m) - 1u32, out);
+                utf8_seqs(hi & !m, hi, out);
+                return;
+            }
+        }
+    }
+    let a = encode(lo);
+    let b = encode(hi);
+    let s: List<i32> = List::with_capacity(2 * a.len());
+    for k in 0..a.len() {
+        s.push(a[k]);
+        s.push(b[k]);
+    }
+    out.push(s);
+}
+
+/// The UTF-8 bytes of code point `c`.
+pub(pkg) fn encode(c: u32) -> List<i32> {
+    let v = c as i32;
+    if c < 0x80u32 { return [v]; }
+    if c < 0x800u32 { return [0xC0 | (v >> 6), 0x80 | (v & 0x3F)]; }
+    if c < 0x10000u32 { return [0xE0 | (v >> 12), 0x80 | ((v >> 6) & 0x3F), 0x80 | (v & 0x3F)]; }
+    [0xF0 | (v >> 18), 0x80 | ((v >> 12) & 0x3F), 0x80 | ((v >> 6) & 0x3F), 0x80 | (v & 0x3F)]
+}

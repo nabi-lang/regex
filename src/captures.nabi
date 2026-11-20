@@ -1,0 +1,249 @@
+// A match and the groups of a match.
+
+use core::collections::ListIntoIter;
+use core::index::Index;
+use core::range::Range;
+
+/// One match: a span of the haystack, in byte offsets on `char`
+/// boundaries.
+///
+/// ```nabi
+/// # fn demo() throws -> bool | none {
+/// let re = try regex::Regex::new("b+");
+/// let m = re.find("abbc")?;
+/// assert(m.range() == (1..3) && m.len() == 2 && !m.is_empty());
+/// # true
+/// # }
+/// # assert(try demo() == true);
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub struct Match {
+    pub(pkg) h: str;
+    pub(pkg) s: usize;
+    pub(pkg) e: usize;
+}
+
+impl Match {
+    /// The byte offset where the match starts.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("c")).find("abc")?.start() == 2);
+    /// ```
+    pub fn start(self) -> usize { self.s }
+
+    /// The byte offset just past the match.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("c")).find("abc")?.end() == 3);
+    /// ```
+    pub fn end(self) -> usize { self.e }
+
+    /// `start()..end()`.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("é")).find("café")?.range() == (3..5));
+    /// ```
+    pub fn range(self) -> Range<usize> { self.s..self.e }
+
+    /// The length in bytes.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("é+")).find("éé")?.len() == 4);
+    /// ```
+    pub fn len(self) -> usize { self.e - self.s }
+
+    /// Whether the match is empty.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("x*")).find("abc")?.is_empty() ?? false);
+    /// ```
+    pub fn is_empty(self) -> bool { self.s == self.e }
+
+    /// The matched text.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new(r"\d+")).find("ab12c")?.as_str() == "12");
+    /// ```
+    pub fn as_str(self) -> str { self.h[self.s:self.e] }
+}
+
+impl Display for Match {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.as_str()) }
+}
+
+/// The groups of one match. Group 0 is the whole match; a group that
+/// took no part in the match is `none`.
+///
+/// Index with a number or a name for the text: `caps[1]`,
+/// `caps["year"]`. That panics when the group did not take part; `get`
+/// and `name` return `none` instead.
+///
+/// ```nabi
+/// # fn demo() throws -> bool | none {
+/// let re = try regex::Regex::new(r"(?<key>\w+)=(?<val>\w+)?");
+/// let c = re.captures("x=")?;
+/// assert(c["key"] == "x" && c.name("val") == none && c.len() == 3);
+/// # true
+/// # }
+/// # assert(try demo() == true);
+/// ```
+#[derive(Clone)]
+pub struct Captures {
+    pub(pkg) h: str;
+    pub(pkg) slots: List<i64>;
+    pub(pkg) names: List<str | none>;
+    pub(pkg) index: Dict<str, usize>;
+}
+
+impl Captures {
+    /// Group `i`, or `none` when it did not take part or does not exist.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let c = (try regex::Regex::new("(a)|(b)")).captures("b")?;
+    /// assert(c.get(1) == none && c.get(2)?.as_str() == "b" && c.get(7) == none);
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn get(self, i: usize) -> Match | none {
+        if 2 * i + 1 >= self.slots.len() { return none; }
+        let s = self.slots[2 * i];
+        let e = self.slots[2 * i + 1];
+        if s < 0i64 || e < 0i64 { return none; }
+        Match { h: self.h, s: s as usize, e: e as usize }
+    }
+
+    /// The group named `name`, or `none`.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let c = (try regex::Regex::new(r"(?<n>\d+)")).captures("a42")?;
+    /// assert(c.name("n")?.as_str() == "42" && c.name("m") == none);
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn name(self, name: str) -> Match | none {
+        if let i: usize = self.index.get(name) { return self.get(i); }
+        none
+    }
+
+    /// The number of groups, group 0 included (also those that did not
+    /// take part).
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("(a)(b)?")).captures("a")?.len() == 3);
+    /// ```
+    pub fn len(self) -> usize { self.slots.len() / 2 }
+
+    /// Every group in order.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let c = (try regex::Regex::new("(a)(x)?")).captures("a")?;
+    /// let texts: List<str> = c.iter().map(|m| if let x: regex::Match = m { x.as_str() } else { "-" }).collect();
+    /// assert(texts == ["a", "a", "-"]);
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn iter(self) -> ListIntoIter<Match | none> {
+        let out: List<Match | none> = List::with_capacity(self.len());
+        for i in 0..self.len() { out.push(self.get(i)); }
+        out.into_iter()
+    }
+
+    /// `template` with `$1`, `$name`, `${1}`, `${name}` replaced by the
+    /// group's text (empty when the group did not take part or does not
+    /// exist) and `$$` by `$`. A name runs as far as letters, digits and
+    /// `_` go, so write `${1}a` for group 1 followed by `a`.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let c = (try regex::Regex::new(r"(?<first>\w+) (\w+)")).captures("Ada Lovelace")?;
+    /// assert(c.expand("$2, ${first} ($$)") == "Lovelace, Ada ($)");
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn expand(self, template: str) -> str {
+        let b = StrBuf::new();
+        self.expand_into(template, b);
+        b.to_str()
+    }
+
+    pub(pkg) fn expand_into(self, template: str, dst: StrBuf) {
+        let t = template;
+        loop {
+            let k = t.find("$") ?? {
+                dst.push_str(t);
+                return;
+            };
+            dst.push_str(t[:k]);
+            t = t[k + 1:];
+            if t.starts_with("$") {
+                dst.push('$');
+                t = t[1:];
+                continue;
+            }
+            let name = "";
+            if t.starts_with("{") {
+                let close = t.find("}") ?? {
+                    dst.push('$');
+                    continue;
+                };
+                name = t[1:close];
+                t = t[close + 1:];
+            } else {
+                let n = 0usize;
+                while n < t.len() {
+                    let c = t.byte(n);
+                    let ok = c == 0x5Fu8 || (c >= 0x30u8 && c <= 0x39u8) || (c >= 0x41u8 && c <= 0x5Au8) || (c >= 0x61u8 && c <= 0x7Au8);
+                    if !ok { break; }
+                    n += 1;
+                }
+                if n == 0 {
+                    dst.push('$');
+                    continue;
+                }
+                name = t[:n];
+                t = t[n:];
+            }
+            let m: Match | none = if let i: usize = try? name.parse::<usize>() { self.get(i) } else { self.name(name) };
+            if let x: Match = m { dst.push_str(x.as_str()); }
+        }
+    }
+}
+
+impl Index<usize> for Captures {
+    type Output = str;
+
+    fn index(self, i: usize) -> str {
+        if let m: Match = self.get(i) { return m.as_str(); }
+        panic(f"group {i} did not take part in the match (or does not exist); use `caps.get({i})` to test for that")
+    }
+}
+
+impl Index<str> for Captures {
+    type Output = str;
+
+    fn index(self, name: str) -> str {
+        if let m: Match = self.name(name) { return m.as_str(); }
+        panic(f"group `{name}` did not take part in the match (or does not exist); use `caps.name(\"{name}\")` to test for that")
+    }
+}
+
+impl Debug for Captures {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let b = StrBuf::new();
+        b.push_str("Captures(");
+        for i in 0..self.len() {
+            if i > 0 { b.push_str(", "); }
+            if let n: str = self.names[i] { b.push_str(f"{n}: "); }
+            if let m: Match = self.get(i) { b.push_str(f"{m.s}..{m.e} {m.as_str():?}"); } else { b.push_str("none"); }
+        }
+        b.push(')');
+        try f.write_str(b.to_str())
+    }
+}

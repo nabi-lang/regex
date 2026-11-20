@@ -1,0 +1,170 @@
+// Realistic haystacks, made the same way on every run: a server log,
+// prose with e-mail addresses and URLs, English text searched for a
+// large literal set, and mixed-script Unicode text. About 1 MiB each;
+// bytes are haystack bytes, every bench counts all matches.
+
+use pkg::Regex;
+use core::bench::Bench;
+use core::hint::black_box;
+
+const SIZE: usize = 1048576;
+
+const WORDS: [str; 48] = [
+    "the", "of", "and", "to", "in", "is", "was", "that", "for", "it", "with", "as", "his", "on", "be", "at",
+    "by", "had", "are", "but", "from", "or", "have", "an", "they", "which", "one", "you", "were", "her", "all", "she",
+    "there", "would", "their", "people", "between", "through", "little", "because", "another", "before", "never", "should", "against", "world", "state", "great",
+];
+
+/// A xorshift generator: the same text on every run and target.
+struct Rng { s: List<u64>; }
+
+impl Rng {
+    fn below(self, n: usize) -> usize {
+        let x = self.s[0];
+        x ^= x << 13u64;
+        x ^= x >> 7u64;
+        x ^= x << 17u64;
+        self.s[0] = x;
+        (x % (n as u64)) as usize
+    }
+}
+
+fn rng() -> Rng { Rng { s: [0x9E3779B97F4A7C15u64] } }
+
+fn log() -> str {
+    let r = rng();
+    let levels = ["INFO", "INFO", "INFO", "DEBUG", "DEBUG", "WARN", "INFO", "DEBUG", "INFO", "ERROR"];
+    let paths = ["/api/v1/items/", "/api/v1/users/", "/static/app.", "/search?q=", "/login", "/health"];
+    let codes = [200, 200, 200, 200, 201, 204, 301, 304, 404, 500, 502, 503];
+    let b = StrBuf::new();
+    while b.len() < SIZE {
+        b.push_str(f"2026-11-{r.below(28) + 1:02}T{r.below(24):02}:{r.below(60):02}:{r.below(60):02}.{r.below(1000):03}Z ");
+        b.push_str(f"{levels[r.below(levels.len())]:<5} [worker-{r.below(32) + 1}] ");
+        b.push_str(f"{r.below(254) + 1}.{r.below(256)}.{r.below(256)}.{r.below(254) + 1} GET ");
+        b.push_str(f"{paths[r.below(paths.len())]}{r.below(99999)} status={codes[r.below(codes.len())]} dur={r.below(3000)}ms\n");
+    }
+    b.to_str()
+}
+
+fn mail() -> str {
+    let r = rng();
+    let tlds = ["com", "org", "net", "io", "dev", "co.uk"];
+    let b = StrBuf::new();
+    while b.len() < SIZE {
+        let k = r.below(100);
+        if k < 3 {
+            b.push_str(f"{WORDS[r.below(48)]}.{WORDS[r.below(48)]}{r.below(99)}@{WORDS[r.below(48)]}.{tlds[r.below(6)]}");
+        } else if k < 5 {
+            b.push_str(f"https://{WORDS[r.below(48)]}.{tlds[r.below(6)]}/{WORDS[r.below(48)]}/{WORDS[r.below(48)]}?id={r.below(1000000)}");
+        } else {
+            b.push_str(WORDS[r.below(48)]);
+        }
+        b.push(if r.below(12) == 0 { '\n' } else { ' ' });
+    }
+    b.to_str()
+}
+
+fn english() -> str {
+    let r = rng();
+    let b = StrBuf::new();
+    while b.len() < SIZE {
+        let w = WORDS[r.below(48)];
+        b.push_str(if r.below(9) == 0 { w.to_uppercase()[:1] + w[1:] } else { w });
+        b.push_str(if r.below(14) == 0 { ".\n" } else { " " });
+    }
+    b.to_str()
+}
+
+fn unicode() -> str {
+    let r = rng();
+    let scripts = ["abcdefghijklmnopqrstuvwxyz", "αβγδεζηθικλμνξοπρστυφχψω", "абвгдежзийклмнопрстуфхцчшщыэюя", "日本語漢字中文字符東京大阪", "éèêàçüöäßñ"];
+    let cs: List<List<char>> = List::new();
+    for s in scripts { cs.push(s.chars().collect()); }
+    let b = StrBuf::new();
+    while b.len() < SIZE {
+        let a = cs[r.below(cs.len())];
+        let n = r.below(8) + 2;
+        for i in 0..n {
+            let c = a[r.below(a.len())];
+            b.push(if i == 0 && r.below(7) == 0 { c.to_simple_uppercase() } else { c });
+        }
+        b.push(if r.below(16) == 0 { '\n' } else { ' ' });
+    }
+    b.to_str()
+}
+
+/// Several hundred literals, few of them in the text: the set of a
+/// word list or a blocklist.
+fn literals() -> str {
+    let r = rng();
+    let out: List<str> = ["through", "between", "against", "because", "another"];
+    let letters = "abcdefghijklmnopqrstuvwxyz";
+    while out.len() < 300 {
+        let b = StrBuf::new();
+        for _ in 0..r.below(6) + 5 { b.push_str(letters[r.below(26):][:1]); }
+        out.push(b.to_str());
+    }
+    out.join("|")
+}
+
+fn run(b: Bench, h: str, pattern: str) {
+    let re = try! Regex::new(pattern);
+    b.set_bytes(h.len() as i64);
+    b.iter(|| {
+        let n = 0;
+        for _ in re.find_iter(black_box(h)) { n += 1; }
+        n
+    });
+}
+
+/// A plain literal in a log.
+#[bench]
+fn log_error(b: Bench) { run(b, log(), "ERROR"); }
+
+/// Whole lines picked by a literal in their middle.
+#[bench]
+fn log_line(b: Bench) { run(b, log(), r"(?m)^\S+ ERROR \[worker-\d+\] (\S+)"); }
+
+/// IPv4 addresses: no literal to look for, all DFA.
+#[bench]
+fn log_ip(b: Bench) { run(b, log(), r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"); }
+
+/// A literal prefix, then a class.
+#[bench]
+fn log_status(b: Bench) { run(b, log(), r"status=5\d\d"); }
+
+/// E-mail addresses in prose.
+#[bench]
+fn email(b: Bench) { run(b, mail(), r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"); }
+
+/// URLs in prose.
+#[bench]
+fn url(b: Bench) { run(b, mail(), r"https?://[^\s/?#]+[^\s]*"); }
+
+/// 300 literals at once.
+#[bench]
+fn literal_set(b: Bench) { run(b, english(), literals()); }
+
+/// A case-insensitive word.
+#[bench]
+fn nocase(b: Bench) { run(b, english(), "(?i)because"); }
+
+/// Three names: the first bytes are rare.
+#[bench]
+fn names(b: Bench) { run(b, english(), "Sherlock|Holmes|Watson"); }
+
+/// Greek words in mixed scripts.
+#[bench]
+fn unicode_greek(b: Bench) { run(b, unicode(), r"\p{Greek}+"); }
+
+/// Every Unicode word.
+#[bench]
+fn unicode_word(b: Bench) { run(b, unicode(), r"\w+"); }
+
+/// Capitalized words in any script.
+#[bench]
+fn unicode_title(b: Bench) { run(b, unicode(), r"\p{Lu}\p{Ll}+"); }
+
+/// A case-insensitive Cyrillic word.
+#[bench]
+fn unicode_nocase(b: Bench) { run(b, unicode(), "(?i)абв"); }

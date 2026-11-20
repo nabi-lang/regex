@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Generate src/tables.nabi, the Unicode tables of the regex package.
+
+Inputs, all UCD 18.0.0 (https://www.unicode.org/Public/18.0.0/ucd/):
+- from the Nabi toolchain tree (compiler/nabic_lexer/ucd/): UnicodeData.txt
+  (general categories), DerivedCoreProperties.txt (Alphabetic, Lowercase,
+  Uppercase), PropList.txt (White_Space, Join_Control)
+- from data/ucd/ here: Scripts.txt, CaseFolding.txt (simple folding: status
+  C and S), PropertyValueAliases.txt (category and script names)
+
+Usage: python3 data/tables.py [TOOLCHAIN_UCD_DIR]
+The directory defaults to ../nabi/compiler/nabic_lexer/ucd beside this
+repository.
+"""
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+LOCAL = os.path.join(HERE, "ucd")
+TOOLCHAIN = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else os.path.join(ROOT, "..", "nabi", "compiler", "nabic_lexer", "ucd")
+)
+OUT = os.path.join(ROOT, "src", "tables.nabi")
+MAX = 0x10FFFF
+
+
+def read(d, name):
+    with open(os.path.join(d, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def records(text):
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            yield [s.strip() for s in line.split(";")]
+
+
+def cp_range(s):
+    lo, _, hi = s.partition("..")
+    return range(int(lo, 16), int(hi or lo, 16) + 1)
+
+
+def prop(text, name):
+    out = set()
+    for f in records(text):
+        if f[1] == name:
+            out.update(cp_range(f[0]))
+    return out
+
+
+def ranges(cps):
+    out = []
+    for c in sorted(cps):
+        if out and out[-1][1] == c - 1:
+            out[-1][1] = c
+        else:
+            out.append([c, c])
+    return out
+
+
+def norm(name):
+    # UAX44-LM3: ignore case, spaces, '_' and '-'.
+    return "".join(ch for ch in name.lower() if ch not in " _-")
+
+
+def categories():
+    cats = {}
+    first = None
+    for line in read(TOOLCHAIN, "UnicodeData.txt").splitlines():
+        f = line.split(";")
+        cp, name, gc = int(f[0], 16), f[1], f[2]
+        if name.endswith(", First>"):
+            first = cp
+            continue
+        lo = first if name.endswith(", Last>") else cp
+        first = None
+        cats.setdefault(gc, set()).update(range(lo, cp + 1))
+    assigned = set().union(*cats.values())
+    cats["Cn"] = set(range(MAX + 1)) - assigned
+    groups = {}
+    for gc, cps in cats.items():
+        groups.setdefault(gc[0], set()).update(cps)
+    cats.update(groups)
+    cats["LC"] = cats["Lu"] | cats["Ll"] | cats["Lt"]
+    return cats
+
+
+def folding():
+    # Orbits of the simple case folding: each set of characters that fold
+    # to the same one.
+    orbit = {}
+    for f in records(read(LOCAL, "CaseFolding.txt")):
+        if f[1] not in ("C", "S"):
+            continue
+        c, t = int(f[0], 16), int(f[2], 16)
+        orbit.setdefault(t, {t}).add(c)
+    pairs = []
+    for members in orbit.values():
+        m = sorted(members)
+        for i, c in enumerate(m):
+            pairs.append((c, m[(i + 1) % len(m)]))
+    return sorted(pairs)
+
+
+def main():
+    cats = categories()
+    core = read(TOOLCHAIN, "DerivedCoreProperties.txt")
+    plist = read(TOOLCHAIN, "PropList.txt")
+    aliases = read(LOCAL, "PropertyValueAliases.txt")
+
+    tables = []  # (key, ranges)
+    names = {}  # normalized name -> table index
+
+    def add(key, cps, *alias):
+        names[key] = len(tables)
+        for a in alias:
+            names.setdefault(a, len(tables))
+        tables.append((key, ranges(cps)))
+
+    for f in records(aliases):
+        if f[0] != "gc":
+            continue
+        short = f[1]
+        if short not in cats:
+            continue
+        add("gc:" + norm(short), cats[short], *("gc:" + norm(a) for a in f[2:]))
+
+    scripts = {}
+    for f in records(read(LOCAL, "Scripts.txt")):
+        scripts.setdefault(f[1], set()).update(cp_range(f[0]))
+    short_of = {}
+    for f in records(aliases):
+        if f[0] == "sc":
+            short_of[f[2]] = f[1:]
+    for long in sorted(scripts):
+        al = short_of.get(long, [long])
+        add("sc:" + norm(long), scripts[long], *("sc:" + norm(a) for a in al))
+
+    alpha = prop(core, "Alphabetic")
+    space = prop(plist, "White_Space")
+    add("bp:alphabetic", alpha, "bp:alpha")
+    add("bp:lowercase", prop(core, "Lowercase"), "bp:lower")
+    add("bp:uppercase", prop(core, "Uppercase"), "bp:upper")
+    add("bp:whitespace", space, "bp:wspace", "bp:space")
+    # UTS #18 Annex C: \w is Alphabetic, Mark, Decimal_Number,
+    # Connector_Punctuation and Join_Control.
+    word = alpha | cats["M"] | cats["Nd"] | cats["Pc"] | prop(plist, "Join_Control")
+    add("perl:word", word)
+
+    flat = []
+    index = []
+    for key, rs in tables:
+        index.append((key, len(flat) // 2, len(rs)))
+        for lo, hi in rs:
+            flat += [lo, hi]
+    fold = folding()
+
+    out = []
+    w = out.append
+    w("// Generated by data/tables.py from UCD 18.0.0. Do not edit.\n\n")
+    w("/// The Unicode version of the tables.\n")
+    w('pub const UNICODE_VERSION: str = "18.0.0";\n\n')
+    w("// Every table's (lo, hi) code point ranges, ascending and disjoint.\n")
+    w(f"pub(pkg) const RANGES: [u32; {len(flat)}] = [\n")
+    w(rows([f"0x{x:X}u32," for x in flat], 8))
+    w("];\n\n")
+    w("// Per table: first pair in RANGES, pair count.\n")
+    w(f"pub(pkg) const TABLE_AT: [u32; {len(index)}] = [\n")
+    w(rows([f"{s}u32," for _, s, _ in index], 12))
+    w("];\n\n")
+    w(f"pub(pkg) const TABLE_LEN: [u32; {len(index)}] = [\n")
+    w(rows([f"{n}u32," for _, _, n in index], 12))
+    w("];\n\n")
+    wk = [i for i, (k, _, _) in enumerate(index) if k == "perl:word"][0]
+    w("// The `perl:word` table, for the `\\b` test.\n")
+    w(f"pub(pkg) const WORD_AT: usize = {index[wk][1]};\n")
+    w(f"pub(pkg) const WORD_LEN: usize = {index[wk][2]};\n\n")
+    keys = sorted(names)
+    w("// Normalized names and aliases, sorted, with their table.\n")
+    w(f"pub(pkg) const NAME: [str; {len(keys)}] = [\n")
+    w(rows([f'"{k}",' for k in keys], 6))
+    w("];\n\n")
+    w(f"pub(pkg) const NAME_TABLE: [u16; {len(keys)}] = [\n")
+    w(rows([f"{names[k]}u16," for k in keys], 12))
+    w("];\n\n")
+    w("// Simple case folding orbits: (c, next) with next the following\n")
+    w("// member of c's orbit, cyclic; sorted by c.\n")
+    w(f"pub(pkg) const FOLD: [u32; {2 * len(fold)}] = [\n")
+    w(rows([f"0x{a:X}u32, 0x{b:X}u32," for a, b in fold], 4))
+    w("];\n")
+    with open(OUT, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+    print(f"{OUT}: {len(tables)} tables, {len(flat) // 2} ranges, {len(keys)} names, {len(fold)} fold pairs")
+
+
+def rows(items, per):
+    return "".join(
+        "    " + " ".join(items[i : i + per]) + "\n" for i in range(0, len(items), per)
+    )
+
+
+if __name__ == "__main__":
+    main()

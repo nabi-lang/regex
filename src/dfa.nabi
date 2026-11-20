@@ -1,0 +1,465 @@
+// A lazy DFA: each state is an ordered set of NFA instructions, built
+// the first time a search needs it and kept in a bounded cache. One
+// byte per step, so a search is linear with a small constant.
+//
+// Looks are decided from the kind of the byte before (in the state) and
+// the byte after (the one being read), so a match is known one byte
+// late: a transition carries "the position before this byte matched".
+// Unicode `\b` needs whole characters; on a non-ASCII byte such a
+// program gives up and the caller falls back to the PikeVM.
+//
+// A transition is the target state's row (its first slot in `trans`:
+// its id times the class count) with tags above `T_TAG`: matched before
+// this byte, the target is a start state a prefilter may skip from, the
+// target is the dead state, not computed yet. An untagged transition
+// is the next row itself, so the hot loop is a load, a compare and an
+// add per byte.
+
+use pkg::hir::{LOOK_END_LINE, LOOK_END_TEXT, LOOK_NOT_WORD, LOOK_NOT_WORD_ASCII, LOOK_START_LINE, LOOK_START_TEXT, LOOK_WORD, LOOK_WORD_ASCII, LOOK_WORD_END, LOOK_WORD_END_ASCII, LOOK_WORD_START, LOOK_WORD_START_ASCII};
+use pkg::prefilter::Prefilter;
+use pkg::prog::{OP_LOOK, OP_MATCH, OP_RANGES, OP_SAVE, OP_SPLIT, Prog};
+
+/// The search could not finish; use the PikeVM.
+pub(pkg) const GAVE_UP: i64 = -2i64;
+
+/// Byte kinds, for looks: before the text (or after it), `\n`, an ASCII
+/// word byte, anything else.
+const K_EDGE: i32 = 0;
+const K_LINE: i32 = 1;
+const K_WORD: i32 = 2;
+const K_OTHER: i32 = 3;
+
+/// Cache clears allowed in one search before giving up.
+const MAX_CLEARS: i64 = 8i64;
+
+const UNICODE_WORD: u32 = (1u32 << 4) | (1u32 << 5) | (1u32 << 8) | (1u32 << 9);
+const LINE_LOOKS: u32 = (1u32 << 2) | (1u32 << 3);
+const WORD_LOOKS: u32 = 0xFF0u32;
+
+// The tags fit 32 bits; rows stay below `T_TAG`.
+const T_TAG: usize = 0x10000000usize;
+const T_MATCH: usize = 0x10000000usize;
+const T_START: usize = 0x20000000usize;
+const T_DEAD: usize = 0x40000000usize;
+const T_UNKNOWN: usize = 0x80000000usize;
+const ROW: usize = 0xFFFFFFFusize;
+
+// A struct copy is a copy of every field, so a `Dfa` is four words:
+// what the search loop reads, and a handle to the rest.
+pub(pkg) struct Dfa {
+    /// The tagged transitions, a row of classes per state.
+    trans: List<usize>;
+    /// Byte to class (256), then each class's representative byte; the
+    /// last class is the end of the text (representative 256).
+    cls: List<usize>;
+    /// See the `S_` indices.
+    stat: List<i64>;
+    /// One element.
+    k: List<Kernels>;
+}
+
+/// What only building states needs.
+struct Kernels {
+    p: Prog;
+    /// The kernels of the states, one after another.
+    kern: List<i32>;
+    /// Per state: kernel offset, kernel length, kind of the byte before,
+    /// unanchored start (0/1), next state with the same kernel hash.
+    meta: List<i32>;
+    /// Kernel hash to the newest state with it.
+    map: Dict<u64, i32>;
+    /// Scratch: sd, ss, td, ts (one slot per instruction), stk, cl, nk.
+    work: List<List<i32>>;
+}
+
+// `stat` slots.
+const S_CLEARS: usize = 0;
+const S_BYTES: usize = 1;
+const S_MARK: usize = 2;
+const S_LIMIT: usize = 3;
+const S_NCLS: usize = 4;
+const S_LONGEST: usize = 5;
+const S_QUIT: usize = 6;
+const S_PREV: usize = 7;
+const S_STARTS: usize = 8;
+/// Where the last forward search stopped reading.
+const S_POS: usize = 16;
+
+const M_AT: usize = 0;
+const M_LEN: usize = 1;
+const M_PREV: usize = 2;
+const M_START: usize = 3;
+const M_NEXT: usize = 4;
+const M_SIZE: usize = 5;
+
+#[inline(always)]
+fn kind(b: i32) -> i32 {
+    if b < 0 { return K_EDGE; }
+    if b == 0x0A { return K_LINE; }
+    if (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F { return K_WORD; }
+    K_OTHER
+}
+
+pub(pkg) fn new(p: Prog, longest: bool, limit: usize) -> Dfa {
+    let looks = p.looks();
+    let cut: List<bool> = List::filled(257, false);
+    cut[0] = true;
+    for t in 0..p.tlo.len() {
+        cut[p.tlo[t] as usize] = true;
+        cut[(p.thi[t] + 1) as usize] = true;
+    }
+    if (looks & LINE_LOOKS) != 0u32 {
+        cut[0x0A] = true;
+        cut[0x0B] = true;
+    }
+    if (looks & WORD_LOOKS) != 0u32 {
+        for x in [0x30, 0x3A, 0x41, 0x5B, 0x5F, 0x60, 0x61, 0x7B, 0x80] { cut[x] = true; }
+    }
+    let cls: List<usize> = List::filled(256, 0usize);
+    let rep: List<usize> = List::new();
+    let c = -1;
+    for b in 0..256 {
+        if cut[b] {
+            c += 1;
+            rep.push(b);
+        }
+        cls[b] = c as usize;
+    }
+    rep.push(256usize);
+    cls.extend(rep);
+    let stat: List<i64> = List::filled(S_POS + 1, 0i64);
+    stat[S_LIMIT] = limit as i64;
+    stat[S_NCLS] = c + 2;
+    stat[S_LONGEST] = if longest { 1i64 } else { 0i64 };
+    stat[S_QUIT] = if (looks & UNICODE_WORD) != 0u32 { 1i64 } else { 0i64 };
+    stat[S_PREV] = if looks != 0u32 { 1i64 } else { 0i64 };
+    let n = p.len();
+    let k = Kernels {
+        p: p, kern: List::new(), meta: List::new(), map: Dict::new(),
+        work: [List::filled(n, 0), List::filled(n, 0), List::filled(n, 0), List::filled(n, 0), List::new(), List::new(), List::new()],
+    };
+    let d = Dfa { trans: List::new(), cls: cls, stat: stat, k: [k] };
+    d.reset();
+    d
+}
+
+/// FNV-1a over the kernel.
+fn hash(pv: i32, nk: List<i32>) -> u64 {
+    let h = (0xcbf29ce484222325u64 ^ (pv as u64)).wrapping_mul(0x100000001b3u64);
+    for pc in nk { h = (h ^ (pc as u64)).wrapping_mul(0x100000001b3u64); }
+    h
+}
+
+impl Dfa {
+    #[inline(always)]
+    fn ncls(self) -> usize { self.stat[S_NCLS] as usize }
+
+    #[inline(always)]
+    fn quit(self) -> bool { self.stat[S_QUIT] != 0i64 }
+
+    fn reset(self) {
+        self.trans.clear();
+        self.k[0].kern.clear();
+        self.k[0].meta.clear();
+        self.k[0].map.clear();
+        for i in S_STARTS..S_STARTS + 8 { self.stat[i] = -1i64; }
+        self.stat[S_BYTES] = 0i64;
+        // state 0: dead
+        for x in [0, 0, 0, 0, -1] { self.k[0].meta.push(x); }
+        for _ in 0..self.ncls() { self.trans.push(T_DEAD); }
+    }
+
+    /// Whether state `id` holds kernel `nk` after a byte of kind `pv`.
+    fn same(self, id: i32, pv: i32, nk: List<i32>) -> bool {
+        let m = (id as usize) * M_SIZE;
+        if self.k[0].meta[m + M_PREV] != pv || self.k[0].meta[m + M_LEN] as usize != nk.len() { return false; }
+        let at = self.k[0].meta[m + M_AT] as usize;
+        for k in 0..nk.len() {
+            if self.k[0].kern[at + k] != nk[k] { return false; }
+        }
+        true
+    }
+
+    /// The state for kernel `nk` after a byte of kind `prev`.
+    fn intern(self, prev: i32, nk: List<i32>) -> i32 {
+        if nk.is_empty() { return 0; }
+        let pv = if self.stat[S_PREV] != 0i64 { prev } else { 0 };
+        let h = hash(pv, nk);
+        let head = self.k[0].map.get(h) ?? -1;
+        let id = head;
+        while id >= 0 {
+            if self.same(id, pv, nk) { return id; }
+            id = self.k[0].meta[(id as usize) * M_SIZE + M_NEXT];
+        }
+        let ncls = self.ncls();
+        let cost = (ncls * 8 + nk.len() * 4 + 48) as i64;
+        if self.stat[S_BYTES] + cost > self.stat[S_LIMIT] || self.trans.len() + ncls >= T_TAG {
+            self.reset();
+            self.stat[S_CLEARS] += 1i64;
+            head = -1;
+        }
+        self.stat[S_BYTES] += cost;
+        let nid = (self.k[0].meta.len() / M_SIZE) as i32;
+        self.k[0].meta.push(self.k[0].kern.len() as i32);
+        self.k[0].meta.push(nk.len() as i32);
+        self.k[0].meta.push(pv);
+        self.k[0].meta.push(0);
+        self.k[0].meta.push(head);
+        self.k[0].kern.extend(nk);
+        for _ in 0..ncls { self.trans.push(T_UNKNOWN); }
+        self.k[0].map.insert(h, nid);
+        nid
+    }
+
+    #[inline(always)]
+    fn start(self, prev: i32, anchored: bool) -> i32 {
+        let s = self.stat[S_STARTS + (prev * 2 + if anchored { 1 } else { 0 }) as usize];
+        if s >= 0i64 { return s as i32; }
+        self.new_start(prev, anchored)
+    }
+
+    fn new_start(self, prev: i32, anchored: bool) -> i32 {
+        let slot = S_STARTS + (prev * 2 + if anchored { 1 } else { 0 }) as usize;
+        let nk = self.k[0].work[6];
+        nk.clear();
+        nk.push(if anchored { self.k[0].p.start() } else { self.k[0].p.ustart() });
+        let id = self.intern(prev, nk);
+        self.stat[slot] = id as i64;
+        if !anchored { self.k[0].meta[(id as usize) * M_SIZE + M_START] = 1; }
+        id
+    }
+
+    fn holds(look: i32, prev: i32, next: i32) -> bool {
+        if look == LOOK_START_TEXT { return prev == K_EDGE; }
+        if look == LOOK_END_TEXT { return next == K_EDGE; }
+        if look == LOOK_START_LINE { return prev == K_EDGE || prev == K_LINE; }
+        if look == LOOK_END_LINE { return next == K_EDGE || next == K_LINE; }
+        let before = prev == K_WORD;
+        let after = next == K_WORD;
+        if look == LOOK_WORD || look == LOOK_WORD_ASCII { return before != after; }
+        if look == LOOK_NOT_WORD || look == LOOK_NOT_WORD_ASCII { return before == after; }
+        if look == LOOK_WORD_START || look == LOOK_WORD_START_ASCII { return !before && after; }
+        if look == LOOK_WORD_END || look == LOOK_WORD_END_ASCII { return before && !after; }
+        false
+    }
+
+    /// The transition of state `s` on class `c`; computes and caches it.
+    fn compute(self, s: i32, c: usize) -> usize {
+        let p = self.k[0].p;
+        let ncls = self.ncls();
+        let longest = self.stat[S_LONGEST] != 0i64;
+        let r = self.cls[256 + c];
+        let b = if r == 256usize { -1 } else { r as i32 };
+        let ms = (s as usize) * M_SIZE;
+        let prev = self.k[0].meta[ms + M_PREV];
+        let next = kind(b);
+        let w = self.k[0].work;
+        let sd = w[0];
+        let ss = w[1];
+        let stk = w[4];
+        let cl = w[5];
+        cl.clear();
+        let n = 0usize;
+        let matched = false;
+        let at = self.k[0].meta[ms + M_AT] as usize;
+        let len = self.k[0].meta[ms + M_LEN] as usize;
+        let i = 0usize;
+        while i < len && !(matched && !longest) {
+            stk.push(self.k[0].kern[at + i]);
+            i += 1;
+            while !stk.is_empty() {
+                let pc = stk.pop() ?? 0;
+                while pc >= 0 {
+                    let x = ss[pc as usize] as usize;
+                    if x < n && sd[x] == pc { break; }
+                    ss[pc as usize] = n as i32;
+                    sd[n] = pc;
+                    n += 1;
+                    let op = p.op[pc as usize];
+                    if op == OP_RANGES {
+                        cl.push(pc);
+                        break;
+                    }
+                    if op == OP_MATCH {
+                        matched = true;
+                        break;
+                    }
+                    if op == OP_SPLIT {
+                        stk.push(p.b[pc as usize]);
+                        pc = p.next[pc as usize];
+                    } else if op == OP_SAVE {
+                        pc = p.next[pc as usize];
+                    } else if op == OP_LOOK {
+                        if Dfa::holds(p.a[pc as usize], prev, next) { pc = p.next[pc as usize]; } else { break; }
+                    } else {
+                        break;
+                    }
+                }
+                if matched && !longest {
+                    // lower-priority threads lose to this match
+                    stk.clear();
+                }
+            }
+        }
+        let nk = w[6];
+        nk.clear();
+        if b >= 0 {
+            let td = w[2];
+            let ts = w[3];
+            let m = 0usize;
+            for pc in cl {
+                let t = p.step(pc, b);
+                if t < 0 { continue; }
+                let x = ts[t as usize] as usize;
+                if x < m && td[x] == t { continue; }
+                ts[t as usize] = m as i32;
+                td[m] = t;
+                m += 1;
+                nk.push(t);
+            }
+            if longest { nk.sort(); }
+        }
+        let clears = self.stat[S_CLEARS];
+        let id = self.intern(next, nk);
+        let enc = (id as usize) * ncls;
+        if id == 0 { enc |= T_DEAD; }
+        if matched { enc |= T_MATCH; }
+        if self.stat[S_MARK] != 0i64 && self.k[0].meta[(id as usize) * M_SIZE + M_START] != 0 { enc |= T_START; }
+        // a clear dropped the row of `s`
+        if self.stat[S_CLEARS] == clears { self.trans[(s as usize) * ncls + c] = enc; }
+        enc
+    }
+
+    /// Marks rows for prefilter skips (`on`) or not; a change drops the
+    /// cache, whose rows carry the marks.
+    #[inline(always)]
+    fn mark(self, on: bool) {
+        let k = if on { 1i64 } else { 0i64 };
+        if self.stat[S_MARK] != k {
+            self.reset();
+            self.stat[S_MARK] = k;
+        }
+    }
+
+    /// Searches forward from `start`; the end of the leftmost-first match
+    /// (or of the first one seen, `earliest`), -1 for none, `GAVE_UP`.
+    /// From a start state, a search with prefilter `pf` skips to the next
+    /// place a match may start.
+    pub(pkg) fn forward(self, h: str, start: usize, end: usize, anchored: bool, earliest: bool, pf: Prefilter) -> i64 {
+        let n = h.len();
+        let b = h.as_bytes();
+        self.stat[S_CLEARS] = 0i64;
+        let skip = !anchored && !pf.is_empty();
+        self.mark(skip);
+        let quit = self.quit();
+        let at = start;
+        if skip {
+            let k = pf.next(h, at, end);
+            if k < 0 { return -1i64; }
+            at = k as usize;
+        }
+        let pb = if at == 0 { -1 } else { b[at - 1] as i32 };
+        if quit && pb >= 0x80 { return GAVE_UP; }
+        let ncls = self.ncls();
+        let s = (self.start(kind(pb), anchored) as usize) * ncls;
+        let last = -1i64;
+        let cls = self.cls;
+        let trans = self.trans;
+        loop {
+            // untagged steps: no match, not dead, not a start state
+            while at < end {
+                let t = trans[s + cls[b[at] as usize]];
+                if t >= T_TAG { break; }
+                s = t;
+                at += 1;
+            }
+            if at >= end { break; }
+            let c = cls[b[at] as usize];
+            let t = trans[s + c];
+            if t == T_UNKNOWN {
+                if quit && b[at] >= 0x80u8 { return GAVE_UP; }
+                t = self.compute((s / ncls) as i32, c);
+                if self.stat[S_CLEARS] > MAX_CLEARS { return GAVE_UP; }
+            }
+            if (t & T_MATCH) != 0 {
+                last = at as i64;
+                if earliest { return last; }
+            }
+            if (t & T_DEAD) != 0 {
+                self.stat[S_POS] = at as i64;
+                return last;
+            }
+            s = t & ROW;
+            at += 1;
+            if (t & T_START) != 0 && last < 0i64 && at < end {
+                let k = pf.next(h, at, end);
+                if k < 0 { return -1i64; }
+                if k as usize != at {
+                    at = k as usize;
+                    let pk = b[at - 1] as i32;
+                    if quit && pk >= 0x80 { return GAVE_UP; }
+                    s = (self.start(kind(pk), false) as usize) * ncls;
+                }
+            }
+        }
+        self.stat[S_POS] = end as i64;
+        let nb = if end < n { b[end] as i32 } else { -1 };
+        if quit && nb >= 0x80 { return GAVE_UP; }
+        let c = if nb < 0 { ncls - 1 } else { cls[nb as usize] };
+        let t = trans[s + c];
+        if t == T_UNKNOWN { t = self.compute((s / ncls) as i32, c); }
+        if (t & T_MATCH) != 0 { last = end as i64; }
+        last
+    }
+
+    /// Bytes the last forward search from `start` read.
+    pub(pkg) fn scanned(self, start: usize) -> usize {
+        let p = self.stat[S_POS] as usize;
+        if p > start { p - start } else { 0 }
+    }
+
+    /// Searches backward from `end` down to `start`, anchored at `end`;
+    /// the leftmost start, -1 for none, `GAVE_UP`.
+    pub(pkg) fn backward(self, h: str, start: usize, end: usize) -> i64 {
+        let n = h.len();
+        let b = h.as_bytes();
+        self.stat[S_CLEARS] = 0i64;
+        self.mark(false);
+        let quit = self.quit();
+        let pb = if end == n { -1 } else { b[end] as i32 };
+        if quit && pb >= 0x80 { return GAVE_UP; }
+        let ncls = self.ncls();
+        let s = (self.start(kind(pb), true) as usize) * ncls;
+        let last = -1i64;
+        let cls = self.cls;
+        let trans = self.trans;
+        let at = end;
+        loop {
+            while at > start {
+                let t = trans[s + cls[b[at - 1] as usize]];
+                if t >= T_TAG { break; }
+                s = t;
+                at -= 1;
+            }
+            if at <= start { break; }
+            let c = cls[b[at - 1] as usize];
+            let t = trans[s + c];
+            if t == T_UNKNOWN {
+                if quit && b[at - 1] >= 0x80u8 { return GAVE_UP; }
+                t = self.compute((s / ncls) as i32, c);
+                if self.stat[S_CLEARS] > MAX_CLEARS { return GAVE_UP; }
+            }
+            if (t & T_MATCH) != 0 { last = at as i64; }
+            if (t & T_DEAD) != 0 { return last; }
+            s = t & ROW;
+            at -= 1;
+        }
+        let nb = if start > 0 { b[start - 1] as i32 } else { -1 };
+        if quit && nb >= 0x80 { return GAVE_UP; }
+        let c = if nb < 0 { ncls - 1 } else { cls[nb as usize] };
+        let t = trans[s + c];
+        if t == T_UNKNOWN { t = self.compute((s / ncls) as i32, c); }
+        if (t & T_MATCH) != 0 { last = start as i64; }
+        last
+    }
+}

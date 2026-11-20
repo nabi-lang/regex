@@ -1,0 +1,676 @@
+// The compiled regex and its searches. A search tries, in order: a
+// plain substring search when the pattern is a literal; the inner
+// literal, the reverse DFA to its start and the forward DFA from there,
+// when the pattern has one; the forward lazy DFA (match end, skipping
+// with the prefilter) then the reverse one (match start); and the PikeVM
+// when a DFA gives up. Groups come from the one-pass DFA when the
+// pattern is one-pass, else from the PikeVM over the match.
+
+use pkg::dfa::{Dfa, GAVE_UP};
+use pkg::hir::Hir;
+use pkg::look::width;
+use pkg::onepass::OnePass;
+use pkg::parse::Flags;
+use pkg::pike::{Pike, WANT_EARLIEST, WANT_FIRST};
+use pkg::prefilter::Prefilter;
+use pkg::prog::Prog;
+use pkg::scan::{Finder, finder};
+use pkg::{Captures, Match, RegexError};
+
+/// Default limit of a compiled program, in bytes.
+pub const DEFAULT_SIZE_LIMIT: usize = 10485760;
+
+/// Default limit of each lazy DFA cache, in bytes.
+pub const DEFAULT_DFA_SIZE_LIMIT: usize = 2097152;
+
+const DEFAULT_FLAGS: Flags = Flags { i: false, m: false, s: false, x: false, swap: false, u: true };
+
+/// Whether `pattern` parses; for `regex!`, which evaluates it while the
+/// program compiles, so the panic is a compile error that shows the
+/// pattern and says what to write.
+pub(pkg) const fn valid(pattern: str) -> bool {
+    try pkg::parse::check(pattern, DEFAULT_FLAGS) catch e { panic(f"invalid regex: {e}"); };
+    true
+}
+
+static CACHE: std::thread::ThreadLocal<Dict<str, Regex>> = std::thread::local(|| -> Dict<str, Regex> { Dict::new() });
+
+/// The regex of `pattern`, compiled once per thread; `regex!` checked
+/// the pattern (`VALID`) when the program was compiled.
+pub(pkg) fn cached<const VALID: bool>(pattern: str) -> Regex {
+    // this thread's map: the pointer stays valid while the thread runs,
+    // and `with` cannot hand a regex out of it
+    let d = unsafe { CACHE.as_ptr().read() };
+    if let r: Regex = d.get(pattern) { return r; }
+    // a valid pattern fails only past the size limit
+    let r = try! Regex::new(pattern);
+    d.insert(pattern, r);
+    r
+}
+
+/// A compiled regular expression.
+///
+/// Matching is linear in the haystack: no pattern makes a search
+/// backtrack. Offsets are byte offsets into the haystack and always fall
+/// on `char` boundaries.
+///
+/// A `Regex` keeps its search caches inside, so it is not `Sync`: build
+/// one per thread.
+///
+/// ```nabi
+/// use regex::Regex;
+///
+/// # fn demo() throws -> bool | none {
+/// let re = try Regex::new(r"(\d{4})-(\d{2})-(\d{2})");
+/// let m = re.find("on 2026-11-14.")?;
+/// assert(m.start() == 3 && m.as_str() == "2026-11-14");
+/// # true
+/// # }
+/// # assert(try demo() == true);
+/// ```
+pub struct Regex {
+    pub(pkg) pat: str;
+    /// One element, shared by copies: a `Regex` is passed around a
+    /// lot, and a struct copy is a copy of every field.
+    pub(pkg) c: List<Core>;
+}
+
+/// The compiled program and its search caches.
+pub(pkg) struct Core {
+    pub(pkg) names: List<str | none>;
+    pub(pkg) index: Dict<str, usize>;
+    pub(pkg) fwd: Prog;
+    pub(pkg) pike: Pike;
+    pub(pkg) fdfa: Dfa;
+    pub(pkg) rdfa: Dfa;
+    /// The whole pattern as a literal, when `R_LITERAL`.
+    pub(pkg) lf: Finder;
+    /// Where a match may start.
+    pub(pkg) pf: Prefilter;
+    pub(pkg) flags: u32;
+    /// With `R_INNER`: the inner literal, and the reverse DFA of the part
+    /// before it.
+    pub(pkg) inl: Finder;
+    pub(pkg) idfa: Dfa;
+    /// The groups of a match in one scan, when the pattern is one-pass.
+    pub(pkg) one: OnePass;
+}
+
+/// The pattern is a literal without groups: a substring search.
+pub(pkg) const R_LITERAL: u32 = 1u32;
+/// Every match starts at offset 0.
+pub(pkg) const R_ANCHORED: u32 = 2u32;
+/// Searches go from an inner literal (`Core::inl`): back to where the
+/// match starts, then forward from there.
+pub(pkg) const R_INNER: u32 = 4u32;
+
+/// Options for building a `Regex`. Each flag here sets the default that
+/// inline flags such as `(?i)` can still change.
+///
+/// ```nabi
+/// use regex::RegexBuilder;
+///
+/// let re = try RegexBuilder::new("^hello$").case_insensitive(true).multi_line(true).build();
+/// assert(re.is_match("say\nHELLO\n"));
+/// ```
+#[derive(Clone)]
+pub struct RegexBuilder {
+    pat: str;
+    flags: Flags;
+    size: usize;
+    dfa_size: usize;
+}
+
+impl RegexBuilder {
+    /// A builder for `pattern` with the default options.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new("a+").build();
+    /// assert(re.is_match("caaat"));
+    /// ```
+    pub fn new(pattern: str) -> RegexBuilder {
+        RegexBuilder { pat: pattern, flags: DEFAULT_FLAGS, size: DEFAULT_SIZE_LIMIT, dfa_size: DEFAULT_DFA_SIZE_LIMIT }
+    }
+
+    /// Letters match their other cases (Unicode simple case folding), as
+    /// with `(?i)`.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new("straße").case_insensitive(true).build();
+    /// assert(re.is_match("STRAßE"));
+    /// ```
+    pub fn case_insensitive(self, yes: bool) -> RegexBuilder {
+        let b = self;
+        b.flags.i = yes;
+        b
+    }
+
+    /// `^` and `$` match at line starts and ends too, as with `(?m)`.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new("^b").multi_line(true).build();
+    /// assert(re.is_match("a\nb"));
+    /// ```
+    pub fn multi_line(self, yes: bool) -> RegexBuilder {
+        let b = self;
+        b.flags.m = yes;
+        b
+    }
+
+    /// `.` matches `\n` too, as with `(?s)`.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new("a.b").dot_matches_new_line(true).build();
+    /// assert(re.is_match("a\nb"));
+    /// ```
+    pub fn dot_matches_new_line(self, yes: bool) -> RegexBuilder {
+        let b = self;
+        b.flags.s = yes;
+        b
+    }
+
+    /// Greedy and lazy repetition trade places, as with `(?U)`.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new("a+").swap_greed(true).build();
+    /// assert(re.find("aaa")?.as_str() == "a");
+    /// ```
+    pub fn swap_greed(self, yes: bool) -> RegexBuilder {
+        let b = self;
+        b.flags.swap = yes;
+        b
+    }
+
+    /// Whitespace in the pattern is ignored and `#` starts a comment, as
+    /// with `(?x)`.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new("a b # comment").ignore_whitespace(true).build();
+    /// assert(re.is_match("ab"));
+    /// ```
+    pub fn ignore_whitespace(self, yes: bool) -> RegexBuilder {
+        let b = self;
+        b.flags.x = yes;
+        b
+    }
+
+    /// Unicode-aware `\w`, `\d`, `\s`, `\b` and case folding (on by
+    /// default); off, they are ASCII only, as with `(?-u)`.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new(r"^\w$").unicode(false).build();
+    /// assert(re.is_match("a") && !re.is_match("é"));
+    /// ```
+    pub fn unicode(self, yes: bool) -> RegexBuilder {
+        let b = self;
+        b.flags.u = yes;
+        b
+    }
+
+    /// The most bytes the compiled program may take (10 MiB by
+    /// default); a larger pattern fails with `RegexError::TooBig`.
+    ///
+    /// ```nabi
+    /// let r = try { _ = try regex::RegexBuilder::new(r"\w{100}").size_limit(1000).build(); true } catch _: regex::RegexError { false };
+    /// assert(!r);
+    /// ```
+    pub fn size_limit(self, bytes: usize) -> RegexBuilder {
+        let b = self;
+        b.size = bytes;
+        b
+    }
+
+    /// The most bytes each lazy DFA cache may take (2 MiB by default).
+    /// A search that keeps overflowing it falls back to the slower
+    /// PikeVM; it never fails.
+    ///
+    /// ```nabi
+    /// let re = try regex::RegexBuilder::new("[a-z]+").dfa_size_limit(4096).build();
+    /// assert(re.is_match("abc"));
+    /// ```
+    pub fn dfa_size_limit(self, bytes: usize) -> RegexBuilder {
+        let b = self;
+        b.dfa_size = bytes;
+        b
+    }
+
+    /// Compiles the pattern.
+    ///
+    /// ```nabi
+    /// let ok = try { _ = try regex::RegexBuilder::new("(").build(); true } catch _: regex::RegexError { false };
+    /// assert(!ok);
+    /// ```
+    pub fn build(self) throws (RegexError) -> Regex {
+        let parsed = try pkg::parse::parse(self.pat, self.flags);
+        let h = parsed.hir;
+        let groups = parsed.names.len();
+        let fwd = try pkg::compile::compile([h], groups, false, true, self.size);
+        let rev = try pkg::compile::compile([h], groups, true, false, self.size);
+        let index: Dict<str, usize> = Dict::new();
+        for i in 0..groups {
+            if let n: str = parsed.names[i] { index.insert(n, i); }
+        }
+        let flags = 0u32;
+        let lit = "";
+        if groups == 1 {
+            if let cs: List<u32> = pkg::hir::literal(h) {
+                lit = text(cs);
+                flags |= R_LITERAL;
+            }
+        }
+        let anchored = pkg::hir::anchored_start(h);
+        if anchored { flags |= R_ANCHORED; }
+        let pf = if anchored { pkg::prefilter::empty() } else { pkg::prefilter::build(text(pkg::hir::prefix(h)), fwd) };
+        let inl = finder("");
+        let idfa = pkg::dfa::new(rev, true, 0);
+        if (flags & (R_LITERAL | R_ANCHORED)) == 0u32 && pf.is_empty() {
+            if let (before, l): (Hir, List<u32>) = pkg::hir::inner(h) {
+                let ip = try pkg::compile::compile([before], 1, true, false, self.size);
+                let lt = text(l);
+                // the part before must not hold the literal's first byte, so
+                // the first literal after a match start is that match's
+                if !pkg::prefilter::reads(ip, lt.byte(0)) {
+                    inl = finder(lt);
+                    idfa = pkg::dfa::new(ip, true, self.dfa_size);
+                    flags |= R_INNER;
+                }
+            }
+        }
+        let c = Core {
+            names: parsed.names, index: index, fwd: fwd, pike: pkg::pike::new(fwd),
+            fdfa: pkg::dfa::new(fwd, false, self.dfa_size), rdfa: pkg::dfa::new(rev, true, self.dfa_size),
+            lf: finder(lit), pf: pf, flags: flags, inl: inl, idfa: idfa,
+            one: if groups > 1 { pkg::onepass::build(fwd) } else { pkg::onepass::empty() },
+        };
+        Regex { pat: self.pat, c: [c] }
+    }
+}
+
+fn text(cs: List<u32>) -> str {
+    let b = StrBuf::new();
+    for c in cs { b.push(char::from_u32(c) ?? '\u{FFFD}'); }
+    b.to_str()
+}
+
+impl Regex {
+    /// Compiles `pattern` with the default options.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"\bcat\b");
+    /// assert(re.is_match("a cat sat") && !re.is_match("concat"));
+    /// ```
+    pub fn new(pattern: str) throws (RegexError) -> Regex { try RegexBuilder::new(pattern).build() }
+
+    /// The pattern as written.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("a|b")).as_str() == "a|b");
+    /// ```
+    pub fn as_str(self) -> str { self.pat }
+
+    /// Whether the regex matches anywhere in `h`.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"\d+");
+    /// assert(re.is_match("abc123") && !re.is_match("abc"));
+    /// ```
+    pub fn is_match(self, h: str) -> bool { self.is_match_at(h, 0) }
+
+    /// `is_match` for a search starting at byte `start` (a char
+    /// boundary); the text before `start` still counts for `^` and `\b`.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"\bb");
+    /// assert(!re.is_match_at("ab", 1));
+    /// ```
+    pub fn is_match_at(self, h: str, start: usize) -> bool {
+        if start > h.len() { return false; }
+        if (self.c[0].flags & R_LITERAL) != 0u32 { return self.c[0].lf.find(h, start, h.len()) >= 0i64; }
+        let anchored = (self.c[0].flags & R_ANCHORED) != 0u32;
+        if anchored && start > 0 { return false; }
+        let from = start;
+        if (self.c[0].flags & R_INNER) != 0u32 {
+            let r = self.inner(h, start);
+            if r[0] != GAVE_UP { return r[0] >= 0i64; }
+            from = r[1] as usize;
+        }
+        let e = self.c[0].fdfa.forward(h, from, h.len(), anchored, true, self.c[0].pf);
+        if e != GAVE_UP { return e >= 0i64; }
+        let slots: List<i64> = [-1i64, -1i64];
+        pkg::pike::search(self.c[0].fwd, self.c[0].pike, h, from, h.len(), anchored, WANT_EARLIEST, slots, 0)
+    }
+
+    /// The end of the first match the engine sees, which may be shorter
+    /// than the one `find` reports; the cheapest search after
+    /// `is_match`.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let re = try regex::Regex::new("a+");
+    /// assert(re.shortest_match("baaa")? == 2);
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn shortest_match(self, h: str) -> usize | none { self.shortest_match_at(h, 0) }
+
+    /// `shortest_match` from byte `start`.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let re = try regex::Regex::new("a+");
+    /// assert(re.shortest_match_at("aba", 1)? == 3);
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn shortest_match_at(self, h: str, start: usize) -> usize | none {
+        if start > h.len() { return none; }
+        if (self.c[0].flags & R_LITERAL) != 0u32 {
+            let k = self.c[0].lf.find(h, start, h.len());
+            return if k >= 0i64 { k as usize + self.c[0].lf.lit.len() } else { none };
+        }
+        let anchored = (self.c[0].flags & R_ANCHORED) != 0u32;
+        if anchored && start > 0 { return none; }
+        let e = self.c[0].fdfa.forward(h, start, h.len(), anchored, true, self.c[0].pf);
+        if e != GAVE_UP { return if e >= 0i64 { e as usize } else { none }; }
+        let slots: List<i64> = [-1i64, -1i64];
+        // the PikeVM's earliest stop records no slots without groups; ask for the end
+        if pkg::pike::search(self.c[0].fwd, self.c[0].pike, h, start, h.len(), anchored, WANT_EARLIEST, slots, 2) { return slots[1] as usize; }
+        none
+    }
+
+    /// The leftmost-first match in `h`.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let re = try regex::Regex::new("[a-z]+");
+    /// let m = re.find("12 abc 34")?;
+    /// assert(m.start() == 3 && m.end() == 6 && m.as_str() == "abc");
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn find(self, h: str) -> Match | none { self.find_at(h, 0) }
+
+    /// `find` from byte `start` (a char boundary); the text before
+    /// `start` still counts for `^` and `\b`.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new("a");
+    /// assert(re.find_at("aXa", 1)?.start() == 2);
+    /// ```
+    pub fn find_at(self, h: str, start: usize) -> Match | none {
+        if start > h.len() { return none; }
+        if (self.c[0].flags & R_LITERAL) != 0u32 {
+            let k = self.c[0].lf.find(h, start, h.len());
+            if k < 0i64 { return none; }
+            return Match { h: h, s: k as usize, e: k as usize + self.c[0].lf.lit.len() };
+        }
+        let anchored = (self.c[0].flags & R_ANCHORED) != 0u32;
+        if anchored && start > 0 { return none; }
+        let from = start;
+        if (self.c[0].flags & R_INNER) != 0u32 {
+            let r = self.inner(h, start);
+            if r[0] != GAVE_UP { return if r[0] >= 0i64 { Match { h: h, s: r[0] as usize, e: r[1] as usize } } else { none }; }
+            from = r[1] as usize;
+        }
+        let e = self.c[0].fdfa.forward(h, from, h.len(), anchored, false, self.c[0].pf);
+        if e == -1i64 { return none; }
+        if e != GAVE_UP {
+            let s = self.c[0].rdfa.backward(h, from, e as usize);
+            if s >= 0i64 { return Match { h: h, s: s as usize, e: e as usize }; }
+        }
+        let slots: List<i64> = [-1i64, -1i64];
+        if pkg::pike::search(self.c[0].fwd, self.c[0].pike, h, from, h.len(), anchored, WANT_FIRST, slots, 2) {
+            return Match { h: h, s: slots[0] as usize, e: slots[1] as usize };
+        }
+        none
+    }
+
+    /// Every non-overlapping match, left to right. An empty match right
+    /// after the previous match is skipped, so `a*` on `"baaab"` yields
+    /// `""`, `"aaa"`, `""` (at 0, 1..4 and 5).
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"\d+");
+    /// let all: List<str> = re.find_iter("1, 22 and 333").map(|m| m.as_str()).collect();
+    /// assert(all == ["1", "22", "333"]);
+    /// ```
+    pub fn find_iter(self, h: str) -> Matches { Matches { re: self, h: h, at: 0, last: -1i64, done: false } }
+
+    /// The groups of the leftmost-first match.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let re = try regex::Regex::new(r"(?<y>\d{4})-(\d{2})");
+    /// let c = re.captures("in 2026-11")?;
+    /// assert(c[0] == "2026-11" && c["y"] == "2026" && c[2] == "11");
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn captures(self, h: str) -> Captures | none { self.captures_at(h, 0) }
+
+    /// `captures` from byte `start`.
+    ///
+    /// ```nabi
+    /// # fn demo() throws -> bool | none {
+    /// let re = try regex::Regex::new(r"(\d)");
+    /// assert(re.captures_at("1 2", 1)?[1] == "2");
+    /// # true
+    /// # }
+    /// # assert(try demo() == true);
+    /// ```
+    pub fn captures_at(self, h: str, start: usize) -> Captures | none {
+        let m = self.find_at(h, start) ?? { return none; };
+        self.groups_of(m)
+    }
+
+    /// The leftmost-first match from `start` by way of the inner literal:
+    /// `[start, end]`, `[-1, _]` for none, or `[GAVE_UP, at]` to go on
+    /// with the plain search from `at` (a DFA gave up, or the literal
+    /// keeps leading to failed tries: past a budget linear in the
+    /// haystack, the plain search keeps the whole search linear).
+    fn inner(self, h: str, start: usize) -> List<i64> {
+        let n = h.len();
+        let budget = 4 * (n - start) + 256;
+        let at = start;
+        loop {
+            let i = self.c[0].inl.find(h, at, n);
+            if i < 0i64 { return [-1i64, 0i64]; }
+            let s = self.c[0].idfa.backward(h, start, i as usize);
+            if s == GAVE_UP { return [GAVE_UP, start as i64]; }
+            if s >= 0i64 {
+                let e = self.c[0].fdfa.forward(h, s as usize, n, true, false, pkg::prefilter::empty());
+                if e == GAVE_UP { return [GAVE_UP, start as i64]; }
+                if e >= 0i64 { return [s, e]; }
+                let used = self.c[0].fdfa.scanned(s as usize) + (i - s) as usize;
+                if used >= budget { return [GAVE_UP, (i + 1i64)]; }
+                budget -= used;
+            }
+            at = i as usize + 1;
+        }
+    }
+
+    /// The groups of match `m`, which this regex found.
+    pub(pkg) fn groups_of(self, m: Match) -> Captures {
+        let k = self.c[0].fwd.slots();
+        let slots: List<i64> = List::filled(k, -1i64);
+        if k == 2 {
+            slots[0] = m.s as i64;
+            slots[1] = m.e as i64;
+        } else if self.c[0].one.is_empty() || !self.c[0].one.run(m.h, m.s, m.e, slots, k) {
+            slots.fill(-1i64);
+            _ = pkg::pike::search(self.c[0].fwd, self.c[0].pike, m.h, m.s, m.e, true, WANT_FIRST, slots, k);
+        }
+        Captures { h: m.h, slots: slots, names: self.c[0].names, index: self.c[0].index }
+    }
+
+    /// The groups of every match, left to right (the matches of
+    /// `find_iter`).
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"(\w)=(\d)");
+    /// let keys: List<str> = re.captures_iter("a=1 b=2").map(|c| c[1]).collect();
+    /// assert(keys == ["a", "b"]);
+    /// ```
+    pub fn captures_iter(self, h: str) -> CaptureMatches { CaptureMatches { it: self.find_iter(h) } }
+
+    /// The pieces of `h` between matches. A match at either end gives an
+    /// empty piece there.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(r"[,;]\s*");
+    /// let parts: List<str> = re.split("a, b;c").collect();
+    /// assert(parts == ["a", "b", "c"]);
+    /// ```
+    pub fn split(self, h: str) -> Split { Split { it: self.find_iter(h), h: h, last: 0 } }
+
+    /// At most `limit` pieces of `split`; the last holds the rest of `h`
+    /// unsplit.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new(",");
+    /// let parts: List<str> = re.splitn("a,b,c", 2).collect();
+    /// assert(parts == ["a", "b,c"]);
+    /// ```
+    pub fn splitn(self, h: str, limit: usize) -> SplitN { SplitN { sp: self.split(h), limit: limit } }
+
+    /// The number of groups, group 0 (the whole match) included.
+    ///
+    /// ```nabi
+    /// assert((try regex::Regex::new("(a)(?:b)(c)")).captures_len() == 3);
+    /// ```
+    pub fn captures_len(self) -> usize { self.c[0].names.len() }
+
+    /// Each group's name, `none` for unnamed ones; group 0 first.
+    ///
+    /// ```nabi
+    /// let re = try regex::Regex::new("(?<a>x)(y)");
+    /// assert(re.capture_names() == [none, "a", none]);
+    /// ```
+    pub fn capture_names(self) -> List<str | none> { self.c[0].names.clone() }
+}
+
+impl Display for Regex {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(self.pat) }
+}
+
+impl Debug for Regex {
+    fn fmt(self, ref f: Formatter) throws (FmtError) { try f.write_str(f"Regex({self.pat:?})") }
+}
+
+/// The matches of `Regex::find_iter`.
+pub struct Matches {
+    re: Regex;
+    h: str;
+    at: usize;
+    last: i64;
+    done: bool;
+}
+
+impl Iterator for Matches {
+    type Item = Match;
+
+    fn next(ref self) -> Match | none {
+        if self.done { return none; }
+        loop {
+            if self.at > self.h.len() {
+                self.done = true;
+                return none;
+            }
+            let m = self.re.find_at(self.h, self.at) ?? {
+                self.done = true;
+                return none;
+            };
+            if m.s == m.e && m.e as i64 == self.last {
+                // an empty match right after the last one: step one char
+                if self.at >= self.h.len() {
+                    self.done = true;
+                    return none;
+                }
+                self.at += width(self.h.byte(self.at));
+                continue;
+            }
+            self.at = m.e;
+            self.last = m.e as i64;
+            return m;
+        }
+    }
+}
+
+/// The groups of each match of `Regex::captures_iter`.
+pub struct CaptureMatches {
+    it: Matches;
+}
+
+impl Iterator for CaptureMatches {
+    type Item = Captures;
+
+    fn next(ref self) -> Captures | none {
+        let m = self.it.next() ?? { return none; };
+        self.it.re.groups_of(m)
+    }
+}
+
+/// The pieces of `Regex::split`.
+pub struct Split {
+    it: Matches;
+    h: str;
+    last: usize;
+}
+
+impl Iterator for Split {
+    type Item = str;
+
+    fn next(ref self) -> str | none {
+        let n = self.h.len();
+        if let m: Match = self.it.next() {
+            let piece = self.h[self.last:m.s];
+            self.last = m.e;
+            return piece;
+        }
+        if self.last > n { return none; }
+        let piece = self.h[self.last:];
+        self.last = n + 1;
+        piece
+    }
+}
+
+/// The pieces of `Regex::splitn`.
+pub struct SplitN {
+    sp: Split;
+    limit: usize;
+}
+
+impl Iterator for SplitN {
+    type Item = str;
+
+    fn next(ref self) -> str | none {
+        if self.limit == 0 { return none; }
+        self.limit -= 1;
+        if self.limit > 0 { return self.sp.next(); }
+        let n = self.sp.h.len();
+        if self.sp.last > n { return none; }
+        let piece = self.sp.h[self.sp.last:];
+        self.sp.last = n + 1;
+        piece
+    }
+}
+
+/// `text` with every regex metacharacter escaped, so it matches itself.
+///
+/// ```nabi
+/// let p = regex::escape("1.5*(x)");
+/// assert(p == r"1\.5\*\(x\)");
+/// assert((try regex::Regex::new(p)).is_match("a 1.5*(x)"));
+/// ```
+pub fn escape(text: str) -> str {
+    let b = StrBuf::with_capacity(text.len());
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(f"{c}") { b.push('\\'); }
+        b.push(c);
+    }
+    b.to_str()
+}

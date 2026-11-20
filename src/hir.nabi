@@ -1,0 +1,194 @@
+// The parsed pattern: a tree with flags already applied, so a case
+// insensitive literal is a class and `.` is a class too.
+
+/// Empty-width assertions. The reverse program swaps the start and end
+/// kinds, so each pair below sits at `k` and `k ^ 1`.
+pub(pkg) const LOOK_START_TEXT: i32 = 0;
+pub(pkg) const LOOK_END_TEXT: i32 = 1;
+pub(pkg) const LOOK_START_LINE: i32 = 2;
+pub(pkg) const LOOK_END_LINE: i32 = 3;
+pub(pkg) const LOOK_WORD_START: i32 = 4;
+pub(pkg) const LOOK_WORD_END: i32 = 5;
+pub(pkg) const LOOK_WORD_START_ASCII: i32 = 6;
+pub(pkg) const LOOK_WORD_END_ASCII: i32 = 7;
+pub(pkg) const LOOK_WORD: i32 = 8;
+pub(pkg) const LOOK_NOT_WORD: i32 = 9;
+pub(pkg) const LOOK_WORD_ASCII: i32 = 10;
+pub(pkg) const LOOK_NOT_WORD_ASCII: i32 = 11;
+
+/// Unbounded `max` of a repetition.
+pub(pkg) const INF: u32 = 0xFFFFFFFFu32;
+
+pub(pkg) enum Hir {
+    /// Matches the empty string.
+    Empty,
+    /// One code point of the set: ascending disjoint `(lo, hi)` pairs,
+    /// flattened. An empty set never matches.
+    Class(List<u32>),
+    Look(i32),
+    Repeat { sub: List<Hir>; min: u32; max: u32; greedy: bool; },
+    /// A capturing group; `index` counts from 1.
+    Group { sub: List<Hir>; index: u32; },
+    Concat(List<Hir>),
+    Alt(List<Hir>),
+}
+
+/// The single code point of a one-character class.
+pub(pkg) const fn single(h: Hir) -> u32 | none {
+    match h {
+        Hir::Class(r) => if r.len() == 2 && r[0] == r[1] { r[0] } else { none },
+        _ => none,
+    }
+}
+
+/// Whether `h` can only match the empty string at its start position
+/// once a match of `h` has begun at position 0 (a leading `\A`).
+pub(pkg) const fn anchored_start(h: Hir) -> bool {
+    match h {
+        Hir::Look(k) => k == LOOK_START_TEXT,
+        Hir::Group { sub, .. } => anchored_start(sub[0]),
+        Hir::Concat(xs) => xs.len() > 0 && anchored_start(xs[0]),
+        Hir::Alt(xs) => {
+            for x in xs {
+                if !anchored_start(x) { return false; }
+            }
+            xs.len() > 0
+        }
+        Hir::Repeat { sub, min, .. } => min > 0u32 && anchored_start(sub[0]),
+        _ => false,
+    }
+}
+
+/// The literal every match starts with, as code points (possibly
+/// empty).
+pub(pkg) const fn prefix(h: Hir) -> List<u32> {
+    let out: List<u32> = List::new();
+    _ = prefix_into(h, out);
+    out
+}
+
+/// Appends the literal start of `h`; `true` when `h` is entirely that
+/// literal, so what follows may extend it.
+const fn prefix_into(h: Hir, out: List<u32>) -> bool {
+    match h {
+        Hir::Empty => true,
+        Hir::Class(_) => {
+            if let c: u32 = single(h) {
+                out.push(c);
+                true
+            } else {
+                false
+            }
+        }
+        Hir::Group { sub, .. } => prefix_into(sub[0], out),
+        Hir::Concat(xs) => {
+            for x in xs {
+                if !prefix_into(x, out) { return false; }
+            }
+            true
+        }
+        Hir::Repeat { sub, min, max, .. } => {
+            if min == 0u32 { return false; }
+            let full = prefix_into(sub[0], out);
+            full && min == max && min == 1u32
+        }
+        _ => false,
+    }
+}
+
+/// Whether `h` is a plain literal without groups, as code points.
+pub(pkg) const fn literal(h: Hir) -> List<u32> | none {
+    let out: List<u32> = List::new();
+    if lit_into(h, out) { out } else { none }
+}
+
+const fn lit_into(h: Hir, out: List<u32>) -> bool {
+    match h {
+        Hir::Empty => true,
+        Hir::Class(_) => {
+            if let c: u32 = single(h) {
+                out.push(c);
+                true
+            } else {
+                false
+            }
+        }
+        Hir::Concat(xs) => {
+            for x in xs {
+                if !lit_into(x, out) { return false; }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Which look kinds `h` uses, as a bit set.
+pub(pkg) const fn looks(h: Hir) -> u32 {
+    match h {
+        Hir::Look(k) => 1u32 << (k as u32),
+        Hir::Repeat { sub, .. } => looks(sub[0]),
+        Hir::Group { sub, .. } => looks(sub[0]),
+        Hir::Concat(xs) => {
+            let m = 0u32;
+            for x in xs { m |= looks(x); }
+            m
+        }
+        Hir::Alt(xs) => {
+            let m = 0u32;
+            for x in xs { m |= looks(x); }
+            m
+        }
+        _ => 0u32,
+    }
+}
+
+/// Whether `h` can match the empty string.
+pub(pkg) const fn nullable(h: Hir) -> bool {
+    match h {
+        Hir::Empty => true,
+        Hir::Class(_) => false,
+        Hir::Look(_) => true,
+        Hir::Repeat { sub, min, .. } => min == 0u32 || nullable(sub[0]),
+        Hir::Group { sub, .. } => nullable(sub[0]),
+        Hir::Concat(xs) => {
+            for x in xs {
+                if !nullable(x) { return false; }
+            }
+            true
+        }
+        Hir::Alt(xs) => {
+            for x in xs {
+                if nullable(x) { return true; }
+            }
+            false
+        }
+    }
+}
+
+/// A literal inside a top-level concatenation, after a non-empty part:
+/// `(part before, literal)`. Every match holds the literal right after a
+/// match of the part.
+pub(pkg) const fn inner(h: Hir) -> (Hir, List<u32>) | none {
+    let xs = match h {
+        Hir::Concat(xs) => xs,
+        _ => return none,
+    };
+    let k = 1usize;
+    while k < xs.len() {
+        if single(xs[k]) is u32 {
+            let lit: List<u32> = List::new();
+            let j = k;
+            while j < xs.len() {
+                let c = single(xs[j]) ?? { break; };
+                lit.push(c);
+                j += 1;
+            }
+            let before: List<Hir> = List::new();
+            for i in 0..k { before.push(xs[i]); }
+            return (Hir::Concat(before), lit);
+        }
+        k += 1;
+    }
+    none
+}

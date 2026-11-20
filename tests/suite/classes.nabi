@@ -1,0 +1,80 @@
+// Bracket classes, set operations, POSIX and Perl classes.
+
+use pkg::tests::suite::{all, find};
+
+#[test]
+fn brackets() {
+    assert(find("[abc]+", "xxbcay") == "bca");
+    assert(find("[a-c]+", "xxbcad") == "bca");
+    assert(find("[^a-c]+", "abxyzc") == "xyz");
+    assert(find("[]a]+", "x]a]") == "]a]");
+    assert(find("[^]a]+", "]abc") == "bc");
+    assert(find("[a-]+", "x-a-") == "-a-");
+    assert(find("[-a]+", "x-a-") == "-a-");
+    assert(find(r"[\]\[]+", "x[]") == "[]");
+    assert(find(r"[\d.]+", "v1.25!") == "1.25");
+    assert(find(r"[\x41-\x43]+", "ABCD") == "ABC");
+    assert(find("[α-ω]+", "abγδε") == "γδε");
+    assert(find("[^a]", "a\n") == "\n");
+    assert(find(r"[\n]", "a\nb") == "\n");
+    assert(find(r"[\b]", "a\x08") == "\x08");
+}
+
+#[test]
+fn nested_and_set_ops() {
+    assert(find("[a[x-z]]+", "bxaz") == "xaz");
+    assert(find("[[:alpha:]&&[^aeiou]]+", "aexyzi") == "xyz");
+    assert(find("[a-z&&[^aeiou]]+", "aexyzi") == "xyz");
+    assert(find("[a-z--[aeiou]]+", "aexyzi") == "xyz");
+    assert(find("[a-c~~b-d]+", "bcxad") == "ad");
+    assert(find(r"[\w&&\d]+", "ab12") == "12");
+    assert(find("[[^a]&&[^b]]+", "abcd") == "cd");
+    assert(find("[a&&b]", "ab") == none);
+}
+
+#[test]
+fn posix() {
+    assert(find("[[:digit:]]+", "ab123") == "123");
+    assert(find("[[:upper:][:digit:]]+", "abC1D") == "C1D");
+    assert(find("[[:^alpha:]]+", "ab12cd") == "12");
+    assert(find("[[:space:]]+", "a \t\nb") == " \t\n");
+    assert(find("[[:xdigit:]]+", "xyzBEEF0g") == "BEEF0");
+    assert(find("[[:punct:]]+", "ab!?.cd") == "!?.");
+    assert(find("[[:word:]]+", "  a_1 ") == "a_1");
+    // not a POSIX class: a nested class of `:`, `a`, `b`
+    assert(find("[[:ab]]+", "x:ab") == ":ab");
+}
+
+#[test]
+fn perl() {
+    assert(all(r"\d+", "1 22 ٣٤") == ["1", "22", "٣٤"]);
+    assert(all(r"\D+", "a1b") == ["a", "b"]);
+    assert(find(r"\w+", " héllo_9 ") == "héllo_9");
+    assert(find(r"\W+", "ab, cd") == ", ");
+    assert(find(r"\s+", "a \u{3000}\tb") == " \u{3000}\t");
+    assert(find(r"\S+", "  ab  ") == "ab");
+    assert(find(r"(?-u)\d+", "٣4") == "4");
+    assert(find(r"(?-u)\w+", "é_a") == "_a");
+    assert(find(r"(?-u)\s", "\u{3000}") == none);
+    assert(find(r"[^\d\s]+", "1 ab 2") == "ab");
+    assert(find(r"[\D]+", "12ab") == "ab");
+}
+
+#[test]
+fn case_insensitive() {
+    assert(find("(?i)[a-c]+", "xAbCd") == "AbC");
+    assert(find("(?i)[^a]+", "Aab") == "b");
+    assert(find("(?i)k", "\u{212A}") == "\u{212A}");
+    assert(find("(?i)\u{212A}", "k") == "k");
+    assert(find("(?i)ß", "ẞ") == "ẞ");
+    assert(find("(?i)σ+", "ΣσςΣ") == "ΣσςΣ");
+    assert(find("(?i)straße", "STRAßE") == "STRAßE");
+    assert(find("(?i)ǆ", "ǅ") == "ǅ");
+    assert(find("(?i)ǆ", "Ǆ") == "Ǆ");
+    assert(find("(?i)[ǆ]", "ǅ") == "ǅ");
+    assert(find("(?i)é", "É") == "É");
+    assert(find("(?i-u)é", "É") == none);
+    assert(find("(?i-u)a", "A") == "A");
+    assert(find(r"(?i)\x{10400}", "\u{10428}") == "\u{10428}");
+    assert(find(r"(?i)\p{Lu}+", "abC") == "abC");
+}

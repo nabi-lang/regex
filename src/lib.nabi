@@ -1,0 +1,76 @@
+//! Regular expressions with a linear-time guarantee, in the style of
+//! RE2 and Rust's `regex`.
+//!
+//! A pattern compiles to a Thompson NFA over UTF-8 bytes. `is_match`
+//! and `find` run a lazy DFA, forward for the end of a match and
+//! backward for its start, skipping ahead with literal prefilters;
+//! groups come from a one-pass DFA or a PikeVM. None of them
+//! backtracks, so a search takes time linear in the haystack for every
+//! pattern, `(a*)*b` included. In exchange there are no
+//! backreferences and no look-around, which cannot be matched that way.
+//!
+//! ```nabi
+//! use regex::Regex;
+//!
+//! # fn demo() throws -> bool | none {
+//! let re = try Regex::new(r"(?<user>[\w.]+)@(?<host>[\w.]+)");
+//! let c = re.captures("write to ada@example.org today")?;
+//! assert(c["user"] == "ada" && c["host"] == "example.org");
+//! assert(re.replace_all("ada@a.org, bob@b.org", "${user} at ${host}") == "ada at a.org, bob at b.org");
+//! # true
+//! # }
+//! # assert(try demo() == true);
+//! ```
+//!
+//! Syntax: literals and escapes (`\n`, `\x7F`, `\x{1F600}`, `é`),
+//! `.`, classes `[a-z]` `[^...]` with nesting and `&&` `--` `~~`, POSIX
+//! `[[:alpha:]]`, Perl classes `\d \w \s` (Unicode) and `\D \W \S`,
+//! Unicode classes `\pL` `\p{Greek}` `\p{sc=Latin}` `\P{..}`, anchors
+//! `^ $ \A \z \b \B \< \> \b{start} \b{end}`, repetition `* + ? {n}
+//! {n,} {n,m}` with lazy `?` forms, alternation, groups `(..)`,
+//! `(?:..)`, `(?<name>..)`, `(?P<name>..)`, and flags `i m s x U u`,
+//! inline `(?i)` or scoped `(?i:..)`. Unicode tables are UCD 18.0.0.
+//!
+//! `regex!("..")` checks a literal pattern while the program compiles
+//! (a mistake is a compile error with the same message `Regex::new`
+//! would give) and compiles it once per thread at its first use:
+//!
+//! ```nabi
+//! use regex::regex!;
+//!
+//! for line in ["id=7", "id=x"] {
+//!     if regex!(r"^id=\d+$").is_match(line) { println(line); }
+//! }
+//! ```
+
+mod captures;
+mod class;
+mod compile;
+mod dfa;
+mod engine;
+mod error;
+mod hir;
+mod look;
+mod onepass;
+mod parse;
+mod pike;
+mod prefilter;
+mod prog;
+mod replace;
+mod scan;
+mod set;
+mod tables;
+mod unicode;
+
+pub use captures::{Captures, Match};
+pub use engine::{CaptureMatches, DEFAULT_DFA_SIZE_LIMIT, DEFAULT_SIZE_LIMIT, Matches, Regex, RegexBuilder, Split, SplitN, escape};
+pub use error::RegexError;
+pub use replace::{NoExpand, Replacer};
+pub use set::{RegexSet, SetMatches};
+pub use tables::UNICODE_VERSION;
+
+/// `regex!("pattern")`: the `Regex` of a literal pattern, checked while
+/// the program compiles and built once per thread, at the first use.
+#[impl_macro(regex)] pub @macro {
+    ( @p: literal ) => { pkg::engine::cached::<{ pkg::engine::valid(@p) }>(@p) }
+}

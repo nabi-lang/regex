@@ -1,0 +1,70 @@
+// Tests: syntax, classes and Unicode tables, groups, iteration edge
+// cases (empty matches, char boundaries), replacement, splitting, error
+// messages, RegexSet, and that pathological patterns stay linear. The
+// expected results follow Rust's `regex` crate, whose semantics the
+// package mirrors.
+
+mod captures;
+mod classes;
+mod compiled;
+mod errors;
+mod iter;
+mod linear;
+mod replace;
+mod set;
+mod syntax;
+mod unicode;
+
+use pkg::{Match, Regex, RegexError};
+
+pub fn re(p: str) -> Regex { try! Regex::new(p) }
+
+/// `x`, which must not be `none`.
+pub fn some<T>(x: T | none) -> T { x ?? panic("expected a value, got none") }
+
+/// The text of the first match, or `none`.
+pub fn find(p: str, h: str) -> str | none {
+    if let m: Match = re(p).find(h) { m.as_str() } else { none }
+}
+
+/// `(start, end)` of the first match, or `none`.
+pub fn span(p: str, h: str) -> (usize, usize) | none {
+    if let m: Match = re(p).find(h) { (m.start(), m.end()) } else { none }
+}
+
+/// The spans of every match.
+pub fn spans(p: str, h: str) -> List<(usize, usize)> {
+    let out: List<(usize, usize)> = List::new();
+    for m in re(p).find_iter(h) { out.push((m.start(), m.end())); }
+    out
+}
+
+/// The texts of every match.
+pub fn all(p: str, h: str) -> List<str> {
+    let out: List<str> = List::new();
+    for m in re(p).find_iter(h) { out.push(m.as_str()); }
+    out
+}
+
+/// The error message of compiling `p`, `""` when it compiles.
+pub fn err(p: str) -> str {
+    try {
+        _ = try Regex::new(p);
+        ""
+    } catch e: RegexError {
+        match e {
+            RegexError::Syntax { message, .. } => message,
+            RegexError::TooBig { .. } => "too big",
+        }
+    }
+}
+
+/// The byte offset of the error of `p`.
+pub fn err_at(p: str) -> usize | none {
+    try {
+        _ = try Regex::new(p);
+        none
+    } catch e: RegexError {
+        e.position()
+    }
+}

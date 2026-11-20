@@ -1,0 +1,132 @@
+// Syntax errors: position and the advice in the message.
+
+use pkg::tests::suite::{err, err_at};
+use pkg::{RegexBuilder, RegexError};
+
+fn says(p: str, part: str) -> bool {
+    let m = err(p);
+    if !m.contains(part) { panic(f"`{p}`: expected `{part}` in `{m}`"); }
+    true
+}
+
+#[test]
+fn groups() {
+    assert(says("(ab", "unclosed group: add `)`"));
+    assert(err_at("x(ab") == 1);
+    assert(says("ab)", "unopened group"));
+    assert(err_at("ab)") == 2);
+    assert(says("(?<n>a)(?<n>b)", "duplicate group name `n`"));
+    assert(says("(?<>a)", "empty group name"));
+    assert(says("(?<1a>a)", "invalid character `1` in group name"));
+    assert(says("(?<a", "unclosed group name"));
+    assert(says("(?i", "unclosed flag group"));
+    assert(says("(?q)", "unknown flag `q`"));
+    assert(says("(?ii)", "duplicate flag `i`"));
+    assert(says("(?i-)", "`-` without a flag"));
+    assert(says("(?-i-s)", "repeated `-`"));
+    assert(says("(".repeat(300) + ")".repeat(300), "nest deeper than 250"));
+}
+
+#[test]
+fn unsupported() {
+    assert(says(r"(a)\1", "backreferences are not supported"));
+    assert(says(r"(?P<x>a)(?P=x)", "backreferences are not supported"));
+    assert(says(r"\k<x>", "backreferences are not supported"));
+    assert(says("a(?=b)", "look-ahead"));
+    assert(says("a(?!b)", "look-ahead"));
+    assert(says("(?<=a)b", "look-behind"));
+    assert(says("(?<!a)b", "look-behind"));
+    assert(says("(?>a)", "atomic groups are not supported"));
+    assert(says("a*+", "possessive repetition is not supported"));
+    assert(says("(?R)", "recursion is not supported"));
+    assert(says(r"a\Z", "`\\Z` is not supported: write `\\z`"));
+    assert(says(r"\Qa.b\E", "regex::escape"));
+    assert(says(r"\0", "octal escapes are not supported"));
+    assert(says("(?#c)", "comment groups are not supported"));
+}
+
+#[test]
+fn repetition() {
+    assert(says("*a", "has nothing to repeat"));
+    assert(says("a|+", "has nothing to repeat"));
+    assert(says("(?:?)", "has nothing to repeat"));
+    assert(says("a**", "nested repetition"));
+    assert(says("a{2}{3}", "nested repetition"));
+    assert(says("a{", "unclosed counted repetition"));
+    assert(says("a{2", "unclosed counted repetition"));
+    assert(says("a{x}", "unclosed counted repetition"));
+    assert(says("a{,3}", "unclosed counted repetition"));
+    assert(says("x{ 2 }", "unclosed counted repetition"));
+    assert(says("a{3,2}", "write the smaller count first, `{2,3}`"));
+    assert(says("a{1000000}", "larger than 100000"));
+    assert(err_at("ab{3,2}") == 2);
+}
+
+#[test]
+fn classes() {
+    assert(says("[abc", "unclosed class: add `]`"));
+    assert(says("[z-a]", "invalid class range"));
+    assert(says(r"[a-\d]", "cannot end a range"));
+    assert(says("[[:foo:]]", "unknown POSIX class `[:foo:]`"));
+    assert(says(r"\p{Klingon}", "unknown Unicode class `Klingon`"));
+    assert(says(r"\p{sc=Nope}", "unknown Unicode class"));
+    assert(says(r"\p{Greek", "unclosed Unicode class"));
+    assert(says(r"\p", "`\\p` needs a class"));
+}
+
+#[test]
+fn escapes() {
+    assert(says(r"\y", "unknown escape `\\y`: write `y`"));
+    assert(says("a\\", "trailing `\\`"));
+    assert(says(r"\x{110000}", "not a Unicode scalar value"));
+    assert(says(r"\x{D800}", "not a Unicode scalar value"));
+    assert(says(r"\x{}", "empty `\\x{}`"));
+    assert(says(r"\x{12", "unclosed `\\x{..}`"));
+    assert(says(r"\xZ1", "exactly 2 hex digits"));
+    assert(says(r"\x{1g}", "invalid hex digit `g`"));
+    assert(says(r"\b{middle}", "unknown word boundary"));
+}
+
+#[test]
+fn display() {
+    let e = try {
+        _ = try pkg::Regex::new("ab(c");
+        ""
+    } catch e: RegexError { f"{e}" };
+    assert(e == "regex parse error at byte 2: unclosed group: add `)`, or write `\\(` to match a parenthesis\n    ab(c\n      ^");
+    // the caret counts characters, not bytes
+    let u = try {
+        _ = try pkg::Regex::new("éé)");
+        ""
+    } catch e: RegexError { f"{e}" };
+    assert(u.ends_with("\n    éé)\n      ^"));
+}
+
+#[test]
+fn size_limit() {
+    let big = try {
+        _ = try RegexBuilder::new(r"\w{1000}").size_limit(100000).build();
+        ""
+    } catch e: RegexError { f"{e}" };
+    assert(big.contains("exceeds the size limit of 100000 bytes"));
+    let p: usize | none = try { _ = try RegexBuilder::new(r"a{50000}").size_limit(1000).build(); none } catch e: RegexError { e.position() };
+    assert(p == none);
+    // the default limit takes a large but sane pattern
+    assert((try! pkg::Regex::new(r"[a-z]{1000}")).is_match("x".repeat(1000)));
+    let huge = try { _ = try pkg::Regex::new(r"\w{50000}"); false } catch _: RegexError { true };
+    assert(huge);
+}
+
+#[test]
+fn valid_edge_syntax() {
+    assert(err("a{2,}") == "");
+    assert(err("()") == "");
+    assert(err("(?:)") == "");
+    assert(err("(?i)") == "");
+    assert(err("a|") == "");
+    assert(err("[]]") == "");
+    assert(err("[^]]") == "");
+    assert(err(r"\p{L}\pL\PL\P{L}") == "");
+    assert(err(r"(?x) a # b ( c") == "");
+    assert(err("x{0}") == "");
+}

@@ -1,0 +1,77 @@
+// A Thompson NFA over UTF-8 bytes, as parallel lists. A struct of
+// handles: copies share the program.
+
+/// `a`: first transition, `b`: transition count. Transitions are
+/// ascending and disjoint, except in the reverse program, which joins
+/// overlapping ones with splits instead.
+pub(pkg) const OP_RANGES: i32 = 0;
+/// `next` first, then `b`.
+pub(pkg) const OP_SPLIT: i32 = 1;
+/// `a`: slot.
+pub(pkg) const OP_SAVE: i32 = 2;
+/// `a`: look kind.
+pub(pkg) const OP_LOOK: i32 = 3;
+/// `a`: pattern index (for `RegexSet`).
+pub(pkg) const OP_MATCH: i32 = 4;
+pub(pkg) const OP_FAIL: i32 = 5;
+/// Only during compilation.
+pub(pkg) const OP_NOP: i32 = 6;
+
+pub(pkg) struct Prog {
+    pub(pkg) op: List<i32>;
+    pub(pkg) a: List<i32>;
+    pub(pkg) b: List<i32>;
+    pub(pkg) next: List<i32>;
+    pub(pkg) tlo: List<i32>;
+    pub(pkg) thi: List<i32>;
+    pub(pkg) tnext: List<i32>;
+    /// The scalars, in a list so copies of a `Prog` stay small and see
+    /// one another's writes: anchored start, unanchored start (a lazy
+    /// `(?s:.)*?` before the anchored one), capture slots (two per
+    /// group), look kinds used (a bit set), patterns (more than one in a
+    /// `RegexSet`).
+    pub(pkg) meta: List<i64>;
+}
+
+impl Prog {
+    #[inline(always)]
+    pub(pkg) fn len(self) -> usize { self.op.len() }
+
+    #[inline(always)]
+    pub(pkg) fn start(self) -> i32 { self.meta[0] as i32 }
+
+    #[inline(always)]
+    pub(pkg) fn ustart(self) -> i32 { self.meta[1] as i32 }
+
+    #[inline(always)]
+    pub(pkg) fn slots(self) -> usize { self.meta[2] as usize }
+
+    #[inline(always)]
+    pub(pkg) fn looks(self) -> u32 { self.meta[3] as u32 }
+
+    /// The target of instruction `pc`'s transition on byte `b`, or -1.
+    pub(pkg) fn step(self, pc: i32, b: i32) -> i32 {
+        let lo = self.a[pc as usize] as usize;
+        let n = self.b[pc as usize] as usize;
+        if n <= 4 {
+            for t in lo..lo + n {
+                if b < self.tlo[t] { return -1; }
+                if b <= self.thi[t] { return self.tnext[t]; }
+            }
+            return -1;
+        }
+        let l = lo;
+        let h = lo + n;
+        while l < h {
+            let m = (l + h) / 2;
+            if b < self.tlo[m] {
+                h = m;
+            } else if b > self.thi[m] {
+                l = m + 1;
+            } else {
+                return self.tnext[m];
+            }
+        }
+        -1
+    }
+}
