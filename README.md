@@ -137,7 +137,7 @@ per thread.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/regex/latest/docs
+https://docs.nabi-lang.org/packages/regex/latest
 
 ## License
 
